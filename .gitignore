@@ -1,0 +1,29 @@
+# Inventor files: never commit (see README, "Test data")
+*.ipt
+*.IPT
+*.iam
+*.IAM
+*.ipn
+*.IPN
+*.idw
+*.IDW
+*.ide
+*.ipj
+samples/
+exports/
+
+# Build output
+target/
+*.dll
+*.pdb
+*.lib
+*.exp
+*.so
+*.dylib
+
+# Editors / OS
+.vs/
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
