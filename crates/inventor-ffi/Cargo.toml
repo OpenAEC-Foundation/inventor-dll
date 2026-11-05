@@ -1,0 +1,19 @@
+[package]
+name = "inventor-ffi"
+description = "C ABI of inventor-read: inventor.dll / libinventor.so / libinventor.dylib"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "inventor"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+inventor-read.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+inventor-read = { workspace = true, features = ["synth"] }

@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/inventor-read",
+    "crates/inventor-ffi",
+    "crates/inventor-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "LicenseRef-Proprietary"
+publish = false
+rust-version = "1.85"
+
+[workspace.dependencies]
+cfb = "0.16"
+flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
+ruzstd = "0.9"
+bzip2 = "0.6"
+spade = "2.15"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+inventor-read = { path = "crates/inventor-read" }
+
+[profile.release]
+lto = "thin"
+
+# Tessellation and decompression are slow in debug builds.
+[profile.dev.package."*"]
+opt-level = 2
