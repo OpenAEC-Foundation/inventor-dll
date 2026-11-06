@@ -1,0 +1,24 @@
+[package]
+name = "inventor-read"
+description = "Reads Autodesk Inventor parts (.ipt) and assemblies (.iam): container, iProperties, thumbnail, segments, display cache and B-rep meshes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[features]
+# Writers of synthetic Inventor files for tests (SPEC_v0.1 §9), also for the tests of users.
+synth = []
+
+[dependencies]
+cfb.workspace = true
+flate2.workspace = true
+ruzstd.workspace = true
+bzip2.workspace = true
+spade.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+inventor-read = { path = ".", features = ["synth"] }

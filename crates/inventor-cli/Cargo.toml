@@ -1,0 +1,16 @@
+[package]
+name = "inventor-cli"
+description = "The inventor command line tool: info, json, segments, obj, thumbnail"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "inventor-cli"
+path = "src/main.rs"
+
+[dependencies]
+inventor-read.workspace = true
+serde_json.workspace = true
