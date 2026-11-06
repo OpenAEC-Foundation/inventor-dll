@@ -14,7 +14,9 @@ use std::ptr;
 pub struct InventorDocument {
     doc: Document,
     properties: Option<CString>,
-    warnings: Option<CString>,
+    /// The warnings handed out, per state (0 open, 1 meshes read, 2 meshes failed); a string
+    /// once returned stays until close.
+    warnings: Vec<(u8, CString)>,
     scene: Option<Result<FfiScene, CString>>,
 }
 
@@ -70,7 +72,7 @@ pub extern "C" fn inventor_version() -> *const c_char {
 
 fn open(doc: Result<Document, inventor_read::Error>) -> *mut InventorDocument {
     match doc {
-        Ok(doc) => Box::into_raw(Box::new(InventorDocument { doc, properties: None, warnings: None, scene: None })),
+        Ok(doc) => Box::into_raw(Box::new(InventorDocument { doc, properties: None, warnings: Vec::new(), scene: None })),
         Err(e) => {
             set_error(e.to_string());
             ptr::null_mut()
@@ -248,17 +250,20 @@ pub unsafe extern "C" fn inventor_warnings(doc: *mut InventorDocument) -> *const
             set_error("document is null");
             return ptr::null();
         };
-        let list = match &d.scene {
-            Some(Ok(s)) => s.scene.warnings.clone(),
+        let (state, list) = match &d.scene {
+            Some(Ok(s)) => (1, s.scene.warnings.clone()),
             Some(Err(e)) => {
                 let mut w = d.doc.warnings.clone();
                 w.push(e.to_string_lossy().into_owned());
-                w
+                (2, w)
             }
-            None => d.doc.warnings.clone(),
+            None => (0, d.doc.warnings.clone()),
         };
-        d.warnings = Some(cstring(serde_json::to_string(&list).unwrap_or_default()));
-        d.warnings.as_ref().unwrap().as_ptr()
+        if let Some((_, s)) = d.warnings.iter().find(|(k, _)| *k == state) {
+            return s.as_ptr();
+        }
+        d.warnings.push((state, cstring(serde_json::to_string(&list).unwrap_or_default())));
+        d.warnings.last().unwrap().1.as_ptr()
     })
 }
 
@@ -285,6 +290,8 @@ mod tests {
             assert!(!inventor_mesh(doc, 1, &mut m));
             let w = CStr::from_ptr(inventor_warnings(doc)).to_str().unwrap();
             assert_eq!(w, "[]");
+            // a pointer handed out stays valid, and the same state gives the same string
+            assert_eq!(inventor_warnings(doc), w.as_ptr().cast());
             inventor_close(doc);
             assert!(inventor_open(ptr::null()).is_null());
             let junk = [1u8, 2, 3];

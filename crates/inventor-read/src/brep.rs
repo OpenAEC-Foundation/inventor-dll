@@ -6,7 +6,11 @@ use crate::bytes::{latin1, Rd};
 /// The signatures that start the token stream (SPEC §4.1).
 pub const SIGNATURES: [&[u8]; 2] = [b"ASM BinaryFile4", b"ACIS BinaryFile"];
 
-const MAX_RECORDS: usize = 20_000_000;
+/// Bounds of the token stream (a token takes 32 bytes in memory, so these cap the memory a
+/// damaged or hostile segment can ask for at about 0.5 GB).
+const MAX_RECORDS: usize = 4_000_000;
+const MAX_TOKENS: usize = 16_000_000;
+const MAX_RECORD_TOKENS: usize = 1_000_000;
 
 /// One token (SPEC §4.2).
 #[derive(Debug, Clone, PartialEq)]
@@ -129,6 +133,7 @@ fn token(r: &mut Rd) -> Result<Option<Tok>, End> {
 
 fn records(r: &mut Rd) -> (Vec<Record>, End) {
     let mut out = Vec::new();
+    let mut total = 0usize;
     loop {
         if out.len() >= MAX_RECORDS {
             return (out, End::Truncated);
@@ -136,7 +141,13 @@ fn records(r: &mut Rd) -> (Vec<Record>, End) {
         let mut toks = Vec::new();
         loop {
             match token(r) {
-                Ok(Some(t)) => toks.push(t),
+                Ok(Some(t)) => {
+                    total += 1;
+                    if total > MAX_TOKENS || toks.len() >= MAX_RECORD_TOKENS {
+                        return (out, End::Truncated);
+                    }
+                    toks.push(t);
+                }
                 Ok(None) => break,
                 Err(end) => return (out, end),
             }

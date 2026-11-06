@@ -294,8 +294,9 @@ impl Document {
         let base = self.iproperties.part_number.clone().unwrap_or_else(|| "Body".into());
         let mut stats = tess::Stats::default();
         let mut meshes = Vec::new();
+        let mut used = std::collections::HashSet::new();
         for (k, &body) in bodies.iter().enumerate() {
-            let (faces, s) = tess::body(&brep, body, opt);
+            let (faces, s) = tess::body(&brep, body, opt, &mut used);
             stats.merge(&s);
             let mut m = Mesh { name: if bodies.len() > 1 { format!("{base} ({})", k + 1) } else { base.clone() }, ..Default::default() };
             for f in faces {
@@ -332,6 +333,9 @@ impl Document {
         let mut warnings = self.warnings.clone();
         if stats.invalid > 0 {
             warnings.push(format!("Inventor: {} display cache buffers skipped (format unknown or indices out of range)", stats.invalid));
+        }
+        if stats.over_budget > 0 {
+            warnings.push(format!("Inventor: {} display cache buffers skipped (more data than the cache holds)", stats.over_budget));
         }
         if w.orphan_index_buffers > 0 {
             warnings.push(format!("Inventor: {} display cache index buffers without a vertex buffer", w.orphan_index_buffers));

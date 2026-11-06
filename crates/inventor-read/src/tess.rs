@@ -10,6 +10,11 @@
 
 use crate::brep::{Brep, Curve, Surface};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+
+/// Points of one face's loops, and of all faces of a body: beyond these the face (or the rest
+/// of the body) is skipped as damaged.
+const MAX_FACE_POINTS: usize = 1_000_000;
+const MAX_BODY_POINTS: usize = 20_000_000;
 use std::f64::consts::TAU;
 
 type V3 = [f64; 3];
@@ -161,16 +166,22 @@ pub fn body_faces(b: &Brep, body: i32) -> Vec<i32> {
     faces
 }
 
-/// Tessellates one body: its faces with their triangles, and what was skipped.
-pub fn body(b: &Brep, body: i32, opt: &Options) -> (Vec<FaceMesh>, Stats) {
+/// Tessellates one body: its faces with their triangles, and what was skipped. `used` holds the
+/// face, loop and coedge records taken by bodies before (a record shared by several owners in
+/// damaged data is tessellated once).
+pub fn body(b: &Brep, body: i32, opt: &Options, used: &mut HashSet<i32>) -> (Vec<FaceMesh>, Stats) {
     let mut stats = Stats::default();
     if b.body(body).is_some_and(|bd| bd.transform >= 0) {
         stats.transforms_ignored += 1;
     }
-    let mut t = Tessellator { b, opt, edges: HashMap::new() };
+    let mut t = Tessellator { b, opt, edges: HashMap::new(), used, points: 0 };
     let mut meshes = Vec::new();
     for face in body_faces(b, body) {
         stats.faces += 1;
+        if !t.used.insert(face) || t.points > MAX_BODY_POINTS {
+            stats.failed += 1;
+            continue;
+        }
         // damaged input must not take the whole part down
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| t.face(face))).unwrap_or(Err(Skip::Failed));
         match result {
@@ -192,6 +203,9 @@ struct Tessellator<'a> {
     opt: &'a Options,
     /// Sampled points per edge, from its start vertex to its end vertex.
     edges: HashMap<i32, Result<Vec<V3>, String>>,
+    used: &'a mut HashSet<i32>,
+    /// Loop points of the faces so far.
+    points: usize,
 }
 
 impl Tessellator<'_> {
@@ -203,13 +217,24 @@ impl Tessellator<'_> {
             return Err(Skip::Surface(name.clone()));
         }
         let mut loops = Vec::new();
+        let mut count = 0usize;
         for l in chain(face.loop_, |i| b.loop_(i).map(|l| l.next)) {
             let lp = b.loop_(l).ok_or(Skip::Failed)?;
+            if !self.used.insert(l) {
+                return Err(Skip::Failed);
+            }
             let mut pts: Vec<V3> = Vec::new();
             let coedges = chain(lp.coedge, |i| b.coedge(i).map(|c| c.next));
             for c in coedges {
                 let co = b.coedge(c).ok_or(Skip::Failed)?;
+                if !self.used.insert(c) {
+                    return Err(Skip::Failed);
+                }
                 let samples = self.edge(co.edge).map_err(Skip::Curve)?;
+                count += samples.len();
+                if count > MAX_FACE_POINTS {
+                    return Err(Skip::Failed);
+                }
                 let mut s = samples.clone();
                 if !co.forward {
                     s.reverse();
@@ -229,6 +254,7 @@ impl Tessellator<'_> {
         if loops.is_empty() {
             return Err(Skip::Failed);
         }
+        self.points += count;
         match surface {
             Surface::Plane { p, n, u } => plane(p, n, u, face.forward, &loops),
             Surface::Cone { c, a, m, ratio, sin, cos } => cone(c, a, m, ratio, sin, cos, face.forward, &loops),
@@ -463,8 +489,8 @@ fn cone(c: V3, a: V3, m: V3, ratio: f64, sin: f64, cos: f64, forward: bool, loop
     let tiny = 1e-9 * mean_r.max(r0);
 
     // unwrap θ along each loop; the winding tells loops around the axis from closed ones
-    let mut around: Vec<Vec<(f64, f64, Option<V3>)>> = Vec::new();
-    let mut closed: Vec<Vec<(f64, f64, Option<V3>)>> = Vec::new();
+    let mut around: Vec<Vec<Pt>> = Vec::new();
+    let mut closed: Vec<Vec<Pt>> = Vec::new();
     for l in loops {
         let loc: Vec<(f64, f64, f64)> = l.iter().map(|&q| local(q)).collect();
         let mut th: Vec<f64> = Vec::with_capacity(loc.len());
@@ -478,29 +504,46 @@ fn cone(c: V3, a: V3, m: V3, ratio: f64, sin: f64, cos: f64, forward: bool, loop
             };
             th.push(t);
         }
-        let ring: Vec<(f64, f64, Option<V3>)> = th.iter().zip(&loc).zip(l).map(|((&t, s), &q)| (t, s.1, Some(q))).collect();
+        let mut ring: Vec<Pt> = th.iter().zip(&loc).zip(l).map(|((&t, s), &q)| (t, s.1, Some(q))).collect();
         let winding = match (th.first(), th.last()) {
             (Some(&first), Some(&last)) if th.len() > 1 => ((last - first + wrap(first - last)) / TAU).round() as i64,
             _ => 0,
         };
-        if winding != 0 {
-            around.push(ring);
-        } else if ring.len() >= 3 {
-            closed.push(ring);
+        match winding {
+            0 if ring.len() >= 3 => closed.push(ring),
+            0 => {}
+            1 => around.push(ring),
+            -1 => {
+                // run around the axis in increasing θ
+                ring.reverse();
+                around.push(ring);
+            }
+            _ => return None,
         }
     }
-    let mut polys = Vec::new();
+    let mut polys: Vec<Vec<Pt>> = Vec::new();
     match around.len() {
-        0 => polys = closed,
+        0 => {
+            // all loops on one 2π branch, around the widest one
+            let widest = (0..closed.len()).max_by(|&i, &j| extent(&closed[i]).total_cmp(&extent(&closed[j])))?;
+            let reference = mean_theta(&closed[widest]);
+            for mut ring in closed {
+                shift_into(&mut ring, reference - std::f64::consts::PI);
+                polys.push(ring);
+            }
+        }
         1 | 2 => {
-            let side_a = band_side(&around[0]);
+            // the band 0 ≤ θ − start ≤ 2π, with its seam where no closed loop is
+            let start = seam_angle(&around[0], &closed);
+            let side_a = band_side(&around[0], start);
+            let s0 = side_a[0].0;
             let side_b = if around.len() == 2 {
-                band_side(&around[1])
+                band_side(&around[1], s0)
             } else if k != 0.0 {
                 // a cone closed by its apex
                 let apex = -r0 / k;
                 let p = add(c, mul(a, apex));
-                vec![(0.0, apex, Some(p)), (TAU, apex, Some(p))]
+                vec![(s0, apex, Some(p)), (s0 + TAU, apex, Some(p))]
             } else {
                 return None;
             };
@@ -508,11 +551,7 @@ fn cone(c: V3, a: V3, m: V3, ratio: f64, sin: f64, cos: f64, forward: bool, loop
             band.extend(side_b.into_iter().rev());
             polys.push(band);
             for mut ring in closed {
-                let mean = ring.iter().map(|p| p.0).sum::<f64>() / ring.len() as f64;
-                let shift = (mean / TAU).floor() * TAU;
-                for p in &mut ring {
-                    p.0 -= shift;
-                }
+                shift_into(&mut ring, s0);
                 polys.push(ring);
             }
         }
@@ -539,20 +578,52 @@ fn cone(c: V3, a: V3, m: V3, ratio: f64, sin: f64, cos: f64, forward: bool, loop
     Some(compact(FaceMesh { positions, normals, triangles, known: false }))
 }
 
-/// A loop around the axis as one side of the band 0 ≤ θ ≤ 2π: its points by θ, with the
-/// value at the seam (θ = 0 and 2π) interpolated across it.
-fn band_side(ring: &[(f64, f64, Option<V3>)]) -> Vec<(f64, f64, Option<V3>)> {
-    let mut pts: Vec<(f64, f64, Option<V3>)> = ring.iter().map(|&(t, v, q)| (t.rem_euclid(TAU), v, q)).collect();
-    pts.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let (first, last) = (pts[0], pts[pts.len() - 1]);
-    let span = first.0 + TAU - last.0;
-    let seam = if span > 1e-12 { last.1 + (first.1 - last.1) * (TAU - last.0) / span } else { first.1 };
-    let mut out = Vec::with_capacity(pts.len() + 2);
-    if first.0 > 1e-12 {
-        out.push((0.0, seam, None));
+/// A point of a cone face in its parameter plane: θ, v, and the edge point it came from.
+type Pt = (f64, f64, Option<V3>);
+
+fn mean_theta(ring: &[Pt]) -> f64 {
+    ring.iter().map(|p| p.0).sum::<f64>() / ring.len().max(1) as f64
+}
+
+fn extent(ring: &[Pt]) -> f64 {
+    let (lo, hi) = ring.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p.0), hi.max(p.0)));
+    hi - lo
+}
+
+/// Moves a closed ring by whole turns so that its mean θ lies in [lo, lo + 2π).
+fn shift_into(ring: &mut [Pt], lo: f64) {
+    let turns = ((mean_theta(ring) - lo) / TAU).floor() * TAU;
+    for p in ring {
+        p.0 -= turns;
     }
-    out.extend(pts.iter().copied());
-    out.push(if first.0 > 1e-12 { (TAU, seam, None) } else { (TAU, first.1, first.2) });
+}
+
+/// A θ for the seam of the band: one of the points of the loop `ring`, outside the θ range of
+/// every closed loop (holes) if there is such a point.
+fn seam_angle(ring: &[Pt], closed: &[Vec<Pt>]) -> f64 {
+    let ranges: Vec<(f64, f64)> = closed.iter().map(|r| r.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p.0), hi.max(p.0)))).collect();
+    let covered = |t: f64| ranges.iter().any(|&(lo, hi)| (t - lo).rem_euclid(TAU) <= hi - lo);
+    ring.iter().map(|p| p.0).find(|&t| !covered(t)).unwrap_or(ring[0].0)
+}
+
+/// A loop around the axis (θ increasing) as one side of the band: in loop order from the point
+/// nearest to θ = `start` (mod 2π), once around, ending on that point again 2π further.
+fn band_side(ring: &[Pt], start: f64) -> Vec<Pt> {
+    let n = ring.len();
+    let gap = |t: f64| {
+        let d = (t - start).rem_euclid(TAU);
+        d.min(TAU - d)
+    };
+    let j = (0..n).min_by(|&a, &b| gap(ring[a].0).total_cmp(&gap(ring[b].0))).unwrap_or(0);
+    let mut out: Vec<Pt> = Vec::with_capacity(n + 1);
+    out.extend(ring[j..].iter().copied());
+    out.extend(ring[..j].iter().map(|&(t, v, q)| (t + TAU, v, q)));
+    out.push((ring[j].0 + TAU, ring[j].1, ring[j].2));
+    // the start next to `start`
+    let turns = ((out[0].0 - start) / TAU).round() * TAU;
+    for p in &mut out {
+        p.0 -= turns;
+    }
     out
 }
 
@@ -613,16 +684,27 @@ fn orient(meshes: &mut [FaceMesh]) -> usize {
             neighbours.entry(g).or_default().push((f, v));
         }
     }
+    // layer by layer outwards from the planar faces: each face takes the summed votes of its
+    // neighbours decided before it
+    let none: &[(usize, i64)] = &[];
     let mut state: Vec<Option<bool>> = meshes.iter().map(|m| m.known.then_some(false)).collect();
-    let mut queue: VecDeque<usize> = (0..meshes.len()).filter(|&f| meshes[f].known).collect();
-    while let Some(f) = queue.pop_front() {
-        let flipped = state[f].unwrap_or(false);
-        for &(g, v) in neighbours.get(&f).map(Vec::as_slice).unwrap_or(&[]) {
-            if state[g].is_none() {
-                state[g] = Some(flipped ^ (v < 0));
-                queue.push_back(g);
-            }
+    let mut frontier: Vec<usize> = (0..meshes.len()).filter(|&f| meshes[f].known).collect();
+    while !frontier.is_empty() {
+        let mut next: Vec<usize> =
+            frontier.iter().flat_map(|f| neighbours.get(f).map(Vec::as_slice).unwrap_or(none)).map(|&(g, _)| g).filter(|&g| state[g].is_none()).collect();
+        next.sort_unstable();
+        next.dedup();
+        let decided: Vec<(usize, bool)> = next
+            .iter()
+            .map(|&g| {
+                let sum: i64 = neighbours[&g].iter().filter_map(|&(f, v)| state[f].map(|flipped| if flipped { -v } else { v })).sum();
+                (g, sum < 0)
+            })
+            .collect();
+        for &(g, flip) in &decided {
+            state[g] = Some(flip);
         }
+        frontier = next;
     }
     let mut turned = 0;
     for (m, s) in meshes.iter_mut().zip(state) {

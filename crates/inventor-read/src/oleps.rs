@@ -191,7 +191,7 @@ fn parse_set(data: &[u8], start: usize, fmtid: String) -> Option<PropertySet> {
         .iter()
         .find(|(id, _)| *id == 1)
         .and_then(|&(_, off)| read_value(set, off, 1200))
-        .and_then(|v| {
+        .and_then(|(v, _)| {
             v.as_u64().or(match v {
                 Value::I2(c) => Some(c as u16 as u64),
                 _ => None,
@@ -199,14 +199,23 @@ fn parse_set(data: &[u8], start: usize, fmtid: String) -> Option<PropertySet> {
         })
         .unwrap_or(1252) as u16;
     let names = ids.iter().find(|(id, _)| *id == 0).and_then(|&(_, off)| dictionary(set, off, codepage)).unwrap_or_default();
+    let names: std::collections::HashMap<u32, String> = names.into_iter().collect();
     let mut properties = Vec::new();
+    // the values decoded may not add up to more than the set (shared offsets, empty elements)
+    let mut budget = set.len().saturating_mul(2) + 4096;
     for &(id, off) in &ids {
         if id == 0 {
             continue;
         }
-        let value = read_value(set, off, codepage).unwrap_or(Value::Unsupported(0xFFFF));
-        let name = names.iter().find(|(i, _)| *i == id).map(|(_, n)| n.clone());
-        properties.push(Property { id, name, value });
+        let value = match read_value(set, off, codepage) {
+            Some((v, used)) if used <= budget => {
+                budget -= used;
+                v
+            }
+            Some(_) => break,
+            None => Value::Unsupported(0xFFFF),
+        };
+        properties.push(Property { id, name: names.get(&id).cloned(), value });
     }
     Some(PropertySet { fmtid, codepage, properties })
 }
@@ -240,22 +249,26 @@ fn string_bytes(b: &[u8], codepage: u16) -> String {
     }
 }
 
-fn read_value(set: &[u8], off: usize, codepage: u16) -> Option<Value> {
+/// A value and the bytes it took.
+fn read_value(set: &[u8], off: usize, codepage: u16) -> Option<(Value, usize)> {
     let mut r = Rd::at(set, off);
     let vt = r.u16()?;
     r.skip(2)?;
-    if vt & 0x1000 != 0 {
+    let v = if vt & 0x1000 != 0 {
         let n = r.u32()? as usize;
-        if n > MAX_VECTOR {
+        // every element takes at least one byte; empty elements are not allowed in vectors
+        if n > MAX_VECTOR || n > r.remaining() || matches!(vt & 0x0FFF, 0x00 | 0x01) {
             return None;
         }
         let mut items = Vec::with_capacity(n.min(1024));
         for _ in 0..n {
             items.push(scalar(&mut r, vt & 0x0FFF, codepage, true)?);
         }
-        return Some(Value::Vector(items));
-    }
-    scalar(&mut r, vt, codepage, false)
+        Value::Vector(items)
+    } else {
+        scalar(&mut r, vt, codepage, false)?
+    };
+    Some((v, r.p - off))
 }
 
 /// Aligns the reader to 4 bytes from the start of the set (values are padded to 4 bytes).
@@ -294,10 +307,14 @@ fn scalar(r: &mut Rd, vt: u16, codepage: u16, in_vector: bool) -> Option<Value> 
             }
             v
         }
-        0x0C => {
-            // VT_VARIANT (in vectors): a nested typed value
+        0x0C if in_vector => {
+            // VT_VARIANT, only as a vector element ([MS-OLEPS]): one typed value, which is
+            // neither a variant nor a vector itself
             let t = r.u16()?;
             r.skip(2)?;
+            if t == 0x0C || t & 0x1000 != 0 {
+                return None;
+            }
             scalar(r, t, codepage, false)?
         }
         0x10 => {

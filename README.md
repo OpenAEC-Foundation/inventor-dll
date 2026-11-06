@@ -123,8 +123,10 @@ inventor-cli thumbnail bracket.ipt -o bracket.png
 Tests: `cargo test`. Every test builds its Inventor file in the test from the specification
 (`inventor_read::synth`: property sets, `B`/`M` segments with a B-rep token stream of a cube,
 a pin, a frustum and a plate with a hole, compressed with zlib and Zstandard, and a display
-cache); there are no sample files in the repository. A test also feeds damaged files to the
-reader to check that it does not panic.
+cache, and single cylinder faces with holes and notches across the angle seam); there are no
+sample files in the repository. Other tests feed damaged and hostile files to the reader
+(random damage, token floods, nested and shared property values, buffers read many times
+over) to check that it neither panics nor runs out of bounds in memory or time.
 
 ## Open 3D Viewer Studio
 

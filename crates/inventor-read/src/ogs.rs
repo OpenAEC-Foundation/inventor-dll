@@ -234,6 +234,9 @@ pub struct CacheStats {
     pub invalid: usize,
     /// Smaller levels of detail that were left out.
     pub lods_dropped: usize,
+    /// Buffers left out because the buffers before them already read more than the cache
+    /// holds (ranges shared many times over in damaged data).
+    pub over_budget: usize,
 }
 
 fn f32_at(d: &[u8], at: usize) -> f32 {
@@ -245,7 +248,15 @@ fn f32_at(d: &[u8], at: usize) -> f32 {
 pub fn meshes(world: &World, mesh: &[u8]) -> (Vec<CacheMesh>, CacheStats) {
     let mut stats = CacheStats { vertex_buffers: world.vertex_buffers.len(), ..Default::default() };
     let mut out = Vec::new();
+    // what the buffers may read in all: twice the mesh stream, plus some slack
+    let mut budget = mesh.len().saturating_mul(2) + (16 << 20);
     for vb in &world.vertex_buffers {
+        let cost = vb.length + vb.index_buffers.iter().map(|ib| ib.1).sum::<usize>();
+        if cost > budget {
+            stats.over_budget += 1;
+            continue;
+        }
+        budget -= cost;
         let Some(format) = &vb.format else {
             stats.invalid += 1;
             continue;

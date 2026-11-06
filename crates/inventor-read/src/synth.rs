@@ -693,6 +693,9 @@ fn unit(a: V3) -> V3 {
 // ------------------------------------------------------------------------------------------
 // Display cache
 
+/// (offset, length) of a vertex buffer and those of its index buffers.
+type LastBuffer = (u32, u32, Vec<(u32, u32)>);
+
 /// A display cache (SPEC §5): `stream_mesh_000` with the buffers and `world` with the objects.
 #[derive(Default)]
 pub struct Cache {
@@ -701,6 +704,8 @@ pub struct Cache {
     next_id: u64,
     triangle_format: Option<String>,
     line_format: Option<String>,
+    /// The ranges of the last vertex buffer and its index buffers.
+    last: Option<LastBuffer>,
 }
 
 impl Cache {
@@ -757,6 +762,7 @@ impl Cache {
         for v in [1, 0, off, (data.len() * 4) as u32, 1] {
             self.world.extend(v.to_le_bytes());
         }
+        self.last = Some((off, (data.len() * 4) as u32, Vec::new()));
     }
 
     fn index_buffer(&mut self, indices: &[u16]) {
@@ -768,6 +774,34 @@ impl Cache {
         for v in [0, off, (indices.len() * 2) as u32, 1] {
             self.world.extend(v.to_le_bytes());
         }
+        if let Some(last) = &mut self.last {
+            last.2.push((off, (indices.len() * 2) as u32));
+        }
+    }
+
+    /// `n` more triangle vertex buffers (with their index buffers) on the ranges of the last
+    /// one: damaged or hostile data that reads the same bytes many times.
+    pub fn repeat_last(&mut self, n: usize) -> &mut Self {
+        let Some((off, len, ibs)) = self.last.clone() else { return self };
+        let fid = self.triangle_format.clone().expect("a triangle mesh first");
+        for _ in 0..n {
+            let id = self.id();
+            self.header("VertexBuffer", &id);
+            self.world.extend([0, 1]);
+            self.header("VertexFormat", &fid);
+            for v in [1, 0, off, len, 1] {
+                self.world.extend(v.to_le_bytes());
+            }
+            for &(ioff, ilen) in &ibs {
+                let id = self.id();
+                self.header("AIndexBuffer", &id);
+                self.world.push(0);
+                for v in [0, ioff, ilen, 1] {
+                    self.world.extend(v.to_le_bytes());
+                }
+            }
+        }
+        self
     }
 
     /// A triangle mesh in cm (positions and normals per vertex, uv written as 0) with one or

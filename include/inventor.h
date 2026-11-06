@@ -44,7 +44,8 @@ const uint8_t *inventor_thumbnail_png(InventorDocument *doc, size_t *len);
 ptrdiff_t inventor_mesh_count(InventorDocument *doc);
 bool inventor_mesh(InventorDocument *doc, size_t index, InventorMesh *out);
 
-/* JSON array of warning strings (skipped faces and the like). */
+/* JSON array of warning strings (skipped faces and the like): those of opening, then, once
+ * meshes were asked for, those of the meshes. Every string returned stays valid until close. */
 const char *inventor_warnings(InventorDocument *doc);
 
 #ifdef __cplusplus
