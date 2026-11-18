@@ -67,6 +67,9 @@ pub struct Brep {
     pub records: Vec<Record>,
     /// How the record list ended.
     pub end: End,
+    /// Where each `{ }` definition of the stream starts: the record and the token index of
+    /// its `{`. A `{ ref n }` stands for definition `n` of this list.
+    pub definitions: Vec<(u32, u32)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,7 +98,15 @@ pub fn parse(segment: &[u8]) -> Result<Brep, String> {
     let header_strings = records[0].fields.iter().filter_map(|t| if let Tok::Str(s) = t { Some(s.clone()) } else { None }).take(3).collect();
     let mm_per_unit =
         records[0].fields.iter().find_map(|t| if let Tok::Real(v) = t { Some(*v) } else { None }).filter(|v| v.is_finite() && *v > 0.0).unwrap_or(10.0);
-    Ok(Brep { version, header_strings, mm_per_unit, records, end })
+    let mut definitions = Vec::new();
+    for (r, record) in records.iter().enumerate() {
+        for (t, pair) in record.fields.windows(2).enumerate() {
+            if pair[0] == Tok::Open && !matches!(&pair[1], Tok::Id(s) if s == "ref") {
+                definitions.push((r as u32, t as u32));
+            }
+        }
+    }
+    Ok(Brep { version, header_strings, mm_per_unit, records, end, definitions })
 }
 
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
@@ -331,7 +342,31 @@ pub enum Surface {
         sin: f64,
         cos: f64,
     },
-    /// A surface type without specified fields (sphere, torus, spline, ...).
+    /// Centre `c`, radius `r` (negative: the surface normal points inwards), `x` the direction
+    /// of longitude 0 on the equator, `pole` the north pole.
+    Sphere {
+        c: [f64; 3],
+        r: f64,
+        x: [f64; 3],
+        pole: [f64; 3],
+    },
+    /// Centre `c`, axis `a`, the radius of the ring `major` and of the tube `minor` (negative:
+    /// the surface normal points into the tube), `x` the direction of angle 0 around the axis.
+    Torus {
+        c: [f64; 3],
+        a: [f64; 3],
+        major: f64,
+        minor: f64,
+        x: [f64; 3],
+    },
+    /// A B-spline surface: the one the record stores for its surface, exact or an approximation
+    /// of a procedural one. `forward` false: the normal is turned.
+    Spline {
+        surface: Box<crate::nurbs::Surface>,
+        forward: bool,
+    },
+    /// A surface type that is not read; for a spline surface the name of its kind is added
+    /// (`spline-surface helix_spl_circ`).
     Other(String),
 }
 
@@ -348,6 +383,9 @@ pub enum Curve {
         m: [f64; 3],
         ratio: f64,
     },
+    /// A B-spline curve: the one the record stores for an intersection curve.
+    Spline(Box<crate::nurbs::Curve>),
+    /// A curve type that is not read, with the name of its kind (`intcurve-curve helix_int_cur`).
     Other(String),
 }
 
@@ -447,8 +485,78 @@ impl Brep {
                 f.bound()?;
                 Surface::Cone { c, a, m, ratio, sin: f.real()?, cos: f.real()? }
             }
+            "sphere-surface" => Surface::Sphere { c: f.v3()?, r: f.real()?, x: f.v3()?, pole: f.v3()? },
+            "torus-surface" => Surface::Torus { c: f.v3()?, a: f.v3()?, major: f.real()?, minor: f.real()?, x: f.v3()? },
+            "spline-surface" => {
+                let forward = f.logical().unwrap_or(true);
+                let (kind, tokens) = self.definition(i).unwrap_or(("", &[]));
+                match crate::nurbs::find_surface(tokens) {
+                    Some(surface) => Surface::Spline { surface: Box::new(surface), forward },
+                    None => Surface::Other(format!("spline-surface {kind}").trim_end().to_string()),
+                }
+            }
             other => Surface::Other(other.to_string()),
         })
+    }
+
+    /// The `{ }` definition of a record: the name of its kind and the tokens after it up to
+    /// its `}`. A `{ ref n }` gives definition `n` of the stream.
+    pub fn definition(&self, i: i32) -> Option<(&str, &[Tok])> {
+        let fields = &self.record(i)?.fields;
+        let open = fields.iter().position(|t| *t == Tok::Open)?;
+        let (fields, open) = match (fields.get(open + 1)?, fields.get(open + 2)) {
+            (Tok::Id(s), Some(Tok::Int(n))) if s == "ref" => {
+                let &(r, t) = self.definitions.get(usize::try_from(*n).ok()?)?;
+                (&self.records.get(r as usize)?.fields, t as usize)
+            }
+            _ => (fields, open),
+        };
+        let Tok::Id(kind) = fields.get(open + 1)? else { return None };
+        // up to the `}` that closes this `{`
+        let mut depth = 0usize;
+        let mut end = fields.len();
+        for (k, t) in fields.iter().enumerate().skip(open) {
+            match t {
+                Tok::Open => depth += 1,
+                Tok::Close => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = k;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Some((kind, &fields[open + 2..end]))
+    }
+
+    /// The faces with a colour of their own: an attribute whose type name starts with
+    /// `NMx_FFColor_Entity` has its face as its owner and the colour as the text `r,g,b`.
+    pub fn face_colours(&self) -> std::collections::HashMap<i32, [f32; 3]> {
+        let mut out = std::collections::HashMap::new();
+        for r in self.records.iter().filter(|r| r.name.starts_with("NMx_FFColor_Entity")) {
+            let Some(Tok::Ptr(owner)) = r.fields.get(4) else { continue };
+            let colour = r.fields.iter().find_map(|t| if let Tok::Str(s) = t { crate::appearance::from_triple(s) } else { None });
+            if let Some(c) = colour {
+                out.insert(*owner, c);
+            }
+        }
+        out
+    }
+
+    /// A body transform: the images of the x, y and z axes, the translation and the scale.
+    pub fn transform(&self, i: i32) -> Option<[[f64; 3]; 4]> {
+        let r = self.record(i)?;
+        if r.name != "transform" {
+            return None;
+        }
+        let v: Vec<[f64; 3]> = r.fields.iter().filter_map(|t| if let Tok::Vec(v) | Tok::Pos(v) = t { Some(*v) } else { None }).take(4).collect();
+        let scale = r.fields.iter().find_map(|t| if let Tok::Real(s) = t { Some(*s) } else { None }).unwrap_or(1.0);
+        if v.len() != 4 || !v.iter().flatten().all(|x| x.is_finite()) || !scale.is_finite() || scale == 0.0 {
+            return None;
+        }
+        Some([v[0].map(|x| x * scale), v[1].map(|x| x * scale), v[2].map(|x| x * scale), v[3]])
     }
 
     pub fn curve(&self, i: i32) -> Option<Curve> {
@@ -460,6 +568,13 @@ impl Brep {
         Some(match r.name.as_str() {
             "straight-curve" => Curve::Line { p: f.v3()?, d: f.v3()? },
             "ellipse-curve" => Curve::Ellipse { c: f.v3()?, n: f.v3()?, m: f.v3()?, ratio: f.real()? },
+            "intcurve-curve" => {
+                let (kind, tokens) = self.definition(i).unwrap_or(("", &[]));
+                match crate::nurbs::find_curve(tokens) {
+                    Some(curve) => Curve::Spline(Box::new(curve)),
+                    None => Curve::Other(format!("intcurve-curve {kind}").trim_end().to_string()),
+                }
+            }
             other => Curve::Other(other.to_string()),
         })
     }

@@ -210,13 +210,13 @@ fn plate_with_hole() {
 #[test]
 fn unsupported_faces_are_skipped_and_counted() {
     let mut solid = Solid::cube(1.0);
-    solid.set_surface(0, SurfaceSpec::Other("torus-surface"));
+    solid.set_surface(0, SurfaceSpec::Other("offset-surface"));
     solid.set_surface(1, SurfaceSpec::Other("spline-surface"));
     solid.set_surface(2, SurfaceSpec::Other("spline-surface"));
     let doc = open(synth::part(&solid, 1, 228, Ending::EndRecord));
     let scene = doc.scene().unwrap();
     assert_eq!(scene.meshes[0].triangle_count(), 6);
-    assert_eq!(scene.warnings, vec!["Inventor: 3 faces skipped (unsupported surface: spline-surface 2, torus-surface 1)".to_string()]);
+    assert_eq!(scene.warnings, vec!["Inventor: 3 faces skipped (unsupported surface: offset-surface 1, spline-surface 2)".to_string()]);
 }
 
 #[test]

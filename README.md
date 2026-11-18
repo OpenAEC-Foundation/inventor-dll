@@ -15,9 +15,11 @@ maintainers (see "Legal" below).
 - Output: the document type and version, the iProperties (all property sets, and the known
   fields by name), the PNG thumbnail, the segments of the model, the files an assembly
   references, and triangle meshes in **millimetres**:
-  - parts: the B-rep tessellated, one mesh per body;
+  - parts: the B-rep tessellated, one mesh per body (and per colour, where faces have
+    colours of their own);
   - assemblies: the display cache Inventor stores in the file (already in assembly
-    coordinates).
+    coordinates), or, when the file has none, its part files, each tessellated once and placed
+    where the assembly places it; subassemblies are opened up the same way.
 - No writing of Inventor files.
 
 | Crate | What it is |
@@ -43,14 +45,20 @@ on synthetic files, ~ partly, ✗ not in the specification yet.
 | Segments: `B`/`M` pairs, class names, zlib (2011–2025) and Zstandard (2026 and later) (§3) | ✓ |
 | B-rep: token stream, records, `body → lump → shell → face → loop → coedge → edge → vertex` (§4) | ✓ |
 | Faces on planes, cylinders and cones; edges on lines, circles and ellipses (§4.7) | ✓ |
-| Faces on spheres, tori and splines; `intcurve` edges; body transforms | ✗ skipped and counted |
+| Faces on spheres and tori | ✓ checked on real files |
+| Faces on spline surfaces and edges on intersection curves: the B-spline the record stores (exact, or the approximation of a procedural surface or curve), also through `{ ref n }` | ✓ checked on real files |
+| Helical surfaces and curves (`helix_spl_circ`, `helix_spl_line`, `helix_int_cur`: threads, springs), which store no B-spline | ✗ skipped and counted |
+| Body transforms | ✓ |
+| Face colours (`NMx_FFColor_Entity` attributes, as imported models have them) | ✓ |
 | Assembly display cache: vertex formats, vertex and index buffers, finest level of detail (§5) | ✓ |
-| Assemblies without a display cache (Inventor 2013–2015 and others, §6) | ✗ refused with a message |
-| Referenced files of an assembly (`UFRxDoc`) (§6) | ~ listed, not loaded |
-| Colours and materials (§7) | ✗ names only (iProperties) |
+| Assemblies without a display cache, or with an empty one: the placed parts (`AmRxSegment`) with the file of each (`UFRxDoc`), put together from the part files the caller gives | ✓ checked on real files (2014 to 2023) |
+| Suppressed and invisible occurrences, positional representations, level of detail | ✗ every occurrence is shown |
+| Colours and materials (§7) | ~ face colours; a colour that the name of an appearance tells (`Opaque(67,72,77)`, a colour word); the appearance library of the file is not read |
 
 Skipped faces give a warning such as
-`Inventor: 12 faces skipped (unsupported surface: spline-surface 10, torus-surface 2)`.
+`Inventor: 12 faces skipped (unsupported surface: spline-surface helix_spl_circ 12)` or
+`Inventor: 3 faces skipped (could not be tessellated: cone or cylinder 3)`; part files of an
+assembly that were not given such as `Inventor: 2 referenced files not found: Pin.ipt, Nut.ipt`.
 
 ### How parts are tessellated
 
@@ -61,6 +69,15 @@ circles and ellipses every 7.5° by default, `Options::segments_per_circle`), so
 neighbouring faces share their edge points exactly. A constrained Delaunay triangulation of
 the loops gives the triangles inside the face, which are lifted back onto the surface;
 cylinder normals are analytic.
+
+Faces on spheres, tori and B-spline surfaces are triangulated in the parameter plane of the
+surface in the same way, together with a grid of points inside the face so that the triangles
+follow the curvature. A loop that runs once around the surface (the rim of a dome, a fillet
+around a hole) bounds a band: between two such loops, or between one and the pole of a sphere.
+On which side of a loop the face lies follows from the direction of the loop (seen from
+outside, the face is on its left). The parameters of an edge point on a B-spline surface are
+found by Newton's method from the nearest point of a coarse grid. Edges on intersection curves
+are sampled along the stored B-spline through its knots and thinned to a chord tolerance.
 
 The specification gives the outward side of planar faces (normal and face sense). For cones
 and cylinders it does not say which side the surface normal is on (question Q-I1), so a cone
@@ -91,8 +108,23 @@ for m in &scene.meshes {
 for w in &scene.warnings { eprintln!("{w}"); }
 ```
 
-`Document::scene` returns `Error::NoDisplayCache` for an assembly without a display cache;
-`doc.references` then lists the referenced part files.
+`Document::scene` returns `Error::NoDisplayCache` for an assembly without a display cache.
+`Document::scene_with_parts` puts such an assembly together from its part files:
+
+```rust
+let doc = inventor_read::Document::open("frame.iam")?;
+let mut locator = inventor_read::locate::Locator::new("frame.iam".as_ref());
+let scene = doc.scene_with_parts(&inventor_read::Options::default(), &mut |file| locator.read(file))?;
+for m in &scene.meshes {
+    // m.name: the occurrence ("Leg:2", "Drawer:1/Handle:1"), m.part: the file, m.instance: the
+    // number of the placed part, m.color, m.properties: the iProperties of the part
+}
+```
+
+The closure gets a `FileRef` (the stored path, its part below the project folder, the display
+name) and returns the bytes of that file or `None`; `Locator` looks for the file by the end of
+its stored path around the assembly. `doc.assembly()` gives the files and the occurrences with
+their placement matrices without reading any part.
 
 C (`cargo build --release -p inventor-ffi` gives `target/release/inventor.dll`,
 `inventor.dll.lib` and `inventor.lib`; see [`include/inventor.h`](include/inventor.h)):
@@ -118,6 +150,9 @@ inventor-cli info bracket.ipt
 inventor-cli json frame.iam
 inventor-cli obj bracket.ipt -o bracket.obj
 inventor-cli thumbnail bracket.ipt -o bracket.png
+inventor-cli corpus samples/          # every .ipt and .iam below a folder: one line each, totals
+inventor-cli dump frame.iam -o out/   # the unpacked segments and the other streams
+inventor-cli records bracket.ipt cone # the B-rep records whose type name contains "cone"
 ```
 
 Tests: `cargo test`. Every test builds its Inventor file in the test from the specification
@@ -156,7 +191,28 @@ workspace, following Directive 2009/24/EC art. 5(3) and 6 and CJEU C-406/10 SAS/
 - Contributors who have seen the sample files, the analysis material or any of the above do
   not write reader code.
 
-This first version (0.1) was written from `SPEC_v0.1.md` alone.
+The first version (0.1) was written from `SPEC_v0.1.md` alone. What came after it (assemblies
+from their part files, spheres, tori, B-spline curves and surfaces, body transforms, face
+colours) was written outside this role separation: with public sample files at hand as black
+boxes (see "Checked on real files") and with the notes of the OpenAEC `inventor-io` project on
+the record framing, the compact occurrence matrix and the file list of `UFRxDoc`. No Autodesk
+software, no third-party Inventor reader and no licensed kernel documentation was used. That
+difference matters for the legal review named under "Legal".
+
+## Checked on real files
+
+`inventor-cli corpus` over public repositories with Inventor files (not in this repository;
+never commit them), Inventor 2014 to 2023:
+
+| Source | Licence | Parts | Assemblies |
+|---|---|---|---|
+| github.com/bad-alloc-heavy-industries/MXKeyboard (`case/`) | BSD-3-Clause, hardware CERN-OHL-S v2 | 9 | 1 |
+| github.com/RespiraWorks/Ventilator (`manufacturing/`) | Apache-2.0 | 134 | 44 |
+| github.com/robotics-erlangen/hardware (`pasta/mechanics/`) | none stated | 803 | 294 |
+| github.com/starliliko/3d-printed-smart-car-cad (`inventor/`) | none stated | 49 | 119 |
+
+The counts of what opens and what is left out are in the pull request that brought these
+changes; run the command again to get them for the current code.
 
 ## Test data
 

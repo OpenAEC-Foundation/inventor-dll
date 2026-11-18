@@ -9,6 +9,7 @@
 //! specification: see the README).
 
 use crate::brep::{Brep, Curve, Surface};
+use crate::param;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 /// Points of one face's loops, and of all faces of a body: beyond these the face (or the rest
@@ -17,31 +18,31 @@ const MAX_FACE_POINTS: usize = 1_000_000;
 const MAX_BODY_POINTS: usize = 20_000_000;
 use std::f64::consts::TAU;
 
-type V3 = [f64; 3];
+pub(crate) type V3 = [f64; 3];
 
-fn sub(a: V3, b: V3) -> V3 {
+pub(crate) fn sub(a: V3, b: V3) -> V3 {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
-fn add(a: V3, b: V3) -> V3 {
+pub(crate) fn add(a: V3, b: V3) -> V3 {
     [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
 }
-fn mul(a: V3, s: f64) -> V3 {
+pub(crate) fn mul(a: V3, s: f64) -> V3 {
     [a[0] * s, a[1] * s, a[2] * s]
 }
-fn dot(a: V3, b: V3) -> f64 {
+pub(crate) fn dot(a: V3, b: V3) -> f64 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
-fn cross(a: V3, b: V3) -> V3 {
+pub(crate) fn cross(a: V3, b: V3) -> V3 {
     [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
 }
-fn len(a: V3) -> f64 {
+pub(crate) fn len(a: V3) -> f64 {
     dot(a, a).sqrt()
 }
-fn unit(a: V3) -> Option<V3> {
+pub(crate) fn unit(a: V3) -> Option<V3> {
     let l = len(a);
     (l > 1e-300 && l.is_finite()).then(|| mul(a, 1.0 / l))
 }
-fn dist(a: V3, b: V3) -> f64 {
+pub(crate) fn dist(a: V3, b: V3) -> f64 {
     len(sub(a, b))
 }
 
@@ -50,11 +51,15 @@ fn dist(a: V3, b: V3) -> f64 {
 pub struct Options {
     /// Segments of a full circle (edges and cylinders); 48 = 7.5°.
     pub segments_per_circle: u32,
+    /// An assembly is put together from its part files when all of them are given, also when
+    /// it has a display cache; the cache is taken when part files are missing. Off: the cache
+    /// first, the part files only for an assembly without one.
+    pub parts_first: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { segments_per_circle: 48 }
+        Self { segments_per_circle: 48, parts_first: true }
     }
 }
 
@@ -64,6 +69,8 @@ pub struct FaceMesh {
     pub positions: Vec<V3>,
     pub normals: Vec<V3>,
     pub triangles: Vec<[u32; 3]>,
+    /// The colour the face has of its own.
+    pub color: Option<[f32; 3]>,
     /// The orientation follows from the specification (planes); cone faces may be turned to
     /// match their neighbours.
     pub known: bool,
@@ -78,8 +85,8 @@ pub struct Stats {
     pub unsupported_surface: BTreeMap<String, usize>,
     /// Faces skipped per edge curve type that is not specified (`intcurve-curve`: 2).
     pub unsupported_curve: BTreeMap<String, usize>,
-    /// Faces whose records or loops could not be followed or triangulated.
-    pub failed: usize,
+    /// Faces whose records or loops could not be followed or triangulated, per reason.
+    pub failures: BTreeMap<String, usize>,
     /// Cone faces turned to match their planar neighbours.
     pub reoriented: usize,
     /// Bodies with a transform record (not specified, ignored).
@@ -96,13 +103,20 @@ impl Stats {
         for (k, v) in &o.unsupported_curve {
             *self.unsupported_curve.entry(k.clone()).or_default() += v;
         }
-        self.failed += o.failed;
+        for (k, v) in &o.failures {
+            *self.failures.entry(k.clone()).or_default() += v;
+        }
         self.reoriented += o.reoriented;
         self.transforms_ignored += o.transforms_ignored;
     }
 
     pub fn skipped(&self) -> usize {
-        self.unsupported_surface.values().sum::<usize>() + self.unsupported_curve.values().sum::<usize>() + self.failed
+        self.unsupported_surface.values().sum::<usize>() + self.unsupported_curve.values().sum::<usize>() + self.failed()
+    }
+
+    /// Faces whose records or loops could not be followed or triangulated.
+    pub fn failed(&self) -> usize {
+        self.failures.values().sum()
     }
 
     /// Warnings for the skipped faces, e.g. `Inventor: 12 faces skipped (unsupported surface:
@@ -118,8 +132,8 @@ impl Stats {
         if n > 0 {
             out.push(format!("Inventor: {n} faces skipped (unsupported edge curve: {})", list(&self.unsupported_curve)));
         }
-        if self.failed > 0 {
-            out.push(format!("Inventor: {} faces skipped (could not be tessellated)", self.failed));
+        if self.failed() > 0 {
+            out.push(format!("Inventor: {} faces skipped (could not be tessellated: {})", self.failed(), list(&self.failures)));
         }
         if self.transforms_ignored > 0 {
             out.push(format!("Inventor: {} bodies have a transform, which is not read yet (shown untransformed)", self.transforms_ignored));
@@ -131,7 +145,8 @@ impl Stats {
 enum Skip {
     Surface(String),
     Curve(String),
-    Failed,
+    /// With the reason.
+    Failed(&'static str),
 }
 
 /// Cap on the length of a `next` chain (a cycle in damaged data stops here).
@@ -171,30 +186,50 @@ pub fn body_faces(b: &Brep, body: i32) -> Vec<i32> {
 /// damaged data is tessellated once).
 pub fn body(b: &Brep, body: i32, opt: &Options, used: &mut HashSet<i32>) -> (Vec<FaceMesh>, Stats) {
     let mut stats = Stats::default();
-    if b.body(body).is_some_and(|bd| bd.transform >= 0) {
-        stats.transforms_ignored += 1;
-    }
     let mut t = Tessellator { b, opt, edges: HashMap::new(), used, points: 0 };
+    let colours = b.face_colours();
     let mut meshes = Vec::new();
     for face in body_faces(b, body) {
         stats.faces += 1;
         if !t.used.insert(face) || t.points > MAX_BODY_POINTS {
-            stats.failed += 1;
+            *stats.failures.entry("damaged topology".into()).or_default() += 1;
             continue;
         }
         // damaged input must not take the whole part down
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| t.face(face))).unwrap_or(Err(Skip::Failed));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| t.face(face))).unwrap_or(Err(Skip::Failed("damaged geometry")));
         match result {
-            Ok(m) if !m.triangles.is_empty() => {
+            Ok(mut m) if !m.triangles.is_empty() => {
                 stats.tessellated += 1;
+                m.color = colours.get(&face).copied();
                 meshes.push(m);
             }
-            Ok(_) | Err(Skip::Failed) => stats.failed += 1,
+            Ok(_) => *stats.failures.entry("no triangles".into()).or_default() += 1,
+            Err(Skip::Failed(why)) => *stats.failures.entry(why.into()).or_default() += 1,
             Err(Skip::Surface(s)) => *stats.unsupported_surface.entry(s).or_default() += 1,
             Err(Skip::Curve(c)) => *stats.unsupported_curve.entry(c).or_default() += 1,
         }
     }
     stats.reoriented = orient(&mut meshes);
+    // the body stands where its transform puts it
+    if let Some([x, y, z, t]) = b.body(body).and_then(|bd| b.transform(bd.transform)) {
+        let turn = |v: V3| add(add(mul(x, v[0]), mul(y, v[1])), mul(z, v[2]));
+        let mirrored = dot(cross(x, y), z) < 0.0;
+        for m in &mut meshes {
+            for p in &mut m.positions {
+                *p = add(turn(*p), t);
+            }
+            for n in &mut m.normals {
+                *n = unit(turn(*n)).unwrap_or(*n);
+            }
+            if mirrored {
+                for t in &mut m.triangles {
+                    t.swap(1, 2);
+                }
+            }
+        }
+    } else if b.body(body).is_some_and(|bd| bd.transform >= 0) {
+        stats.transforms_ignored += 1;
+    }
     (meshes, stats)
 }
 
@@ -211,29 +246,29 @@ struct Tessellator<'a> {
 impl Tessellator<'_> {
     fn face(&mut self, i: i32) -> Result<FaceMesh, Skip> {
         let b = self.b;
-        let face = b.face(i).ok_or(Skip::Failed)?;
-        let surface = b.surface(face.surface).ok_or(Skip::Failed)?;
+        let face = b.face(i).ok_or(Skip::Failed("damaged topology"))?;
+        let surface = b.surface(face.surface).ok_or(Skip::Failed("surface record not as expected"))?;
         if let Surface::Other(name) = &surface {
             return Err(Skip::Surface(name.clone()));
         }
         let mut loops = Vec::new();
         let mut count = 0usize;
         for l in chain(face.loop_, |i| b.loop_(i).map(|l| l.next)) {
-            let lp = b.loop_(l).ok_or(Skip::Failed)?;
+            let lp = b.loop_(l).ok_or(Skip::Failed("damaged topology"))?;
             if !self.used.insert(l) {
-                return Err(Skip::Failed);
+                return Err(Skip::Failed("damaged topology"));
             }
             let mut pts: Vec<V3> = Vec::new();
             let coedges = chain(lp.coedge, |i| b.coedge(i).map(|c| c.next));
             for c in coedges {
-                let co = b.coedge(c).ok_or(Skip::Failed)?;
+                let co = b.coedge(c).ok_or(Skip::Failed("damaged topology"))?;
                 if !self.used.insert(c) {
-                    return Err(Skip::Failed);
+                    return Err(Skip::Failed("damaged topology"));
                 }
                 let samples = self.edge(co.edge).map_err(Skip::Curve)?;
                 count += samples.len();
                 if count > MAX_FACE_POINTS {
-                    return Err(Skip::Failed);
+                    return Err(Skip::Failed("too many points"));
                 }
                 let mut s = samples.clone();
                 if !co.forward {
@@ -251,16 +286,30 @@ impl Tessellator<'_> {
                 loops.push(pts);
             }
         }
-        if loops.is_empty() {
-            return Err(Skip::Failed);
-        }
         self.points += count;
+        let segments = self.opt.segments_per_circle;
+        let kind = match &surface {
+            Surface::Plane { .. } => "plane",
+            Surface::Cone { .. } => "cone or cylinder",
+            Surface::Sphere { .. } => "sphere",
+            Surface::Torus { .. } => "torus",
+            _ => "spline surface",
+        };
         match surface {
+            Surface::Plane { .. } | Surface::Cone { .. } if loops.is_empty() => None,
             Surface::Plane { p, n, u } => plane(p, n, u, face.forward, &loops),
             Surface::Cone { c, a, m, ratio, sin, cos } => cone(c, a, m, ratio, sin, cos, face.forward, &loops),
+            // a negative radius turns the surface normal inwards
+            Surface::Sphere { c, r, x, pole } => {
+                param::Sphere::new(c, r, x, pole, &loops, segments).and_then(|s| param::face(&s, &loops, face.forward == (r > 0.0)))
+            }
+            Surface::Torus { c, a, major, minor, x } => {
+                param::Torus::new(c, a, major, minor, x, segments).and_then(|s| param::face(&s, &loops, face.forward == (minor > 0.0)))
+            }
+            Surface::Spline { surface, forward } => param::Spline::new(&surface).and_then(|s| param::face(&s, &loops, face.forward == forward)),
             Surface::Other(_) => unreachable!(),
         }
-        .ok_or(Skip::Failed)
+        .ok_or(Skip::Failed(kind))
     }
 
     /// The points of an edge from its start to its end vertex (model units).
@@ -318,13 +367,110 @@ fn sample_edge(b: &Brep, e: i32, opt: &Options) -> Result<Vec<V3>, String> {
             }
             Ok(pts)
         }
+        Some(Curve::Spline(c)) => {
+            // the edge runs along the curve or against it, with its parameters negated then:
+            // whichever meets the vertices
+            let size = c.points.iter().fold(0.0f64, |m, p| m.max(dist([p[0], p[1], p[2]], s))).max(dist(s, t));
+            let err = |sg: f64| dist(c.eval(sg * edge.t0), s) + dist(c.eval(sg * edge.t1), t);
+            let (ea, eb) = (err(1.0), err(-1.0));
+            let sign = if ea <= eb { 1.0 } else { -1.0 };
+            // the curve may be an approximation of the edge: it passes near the vertices
+            if !(ea.min(eb) <= 0.02 * size + 1e-7) || !edge.t0.is_finite() || !edge.t1.is_finite() {
+                return Err("intcurve-curve (its ends are not on its curve)".into());
+            }
+            let (a, z) = (sign * edge.t0, sign * edge.t1);
+            let (lo, hi) = c.range();
+            // through the knots when the edge lies within the range of the curve, else evenly
+            let inside = a.min(z) >= lo - 1e-9 && a.max(z) <= hi + 1e-9;
+            let mut stops = vec![a];
+            if inside {
+                let mut knots = c.knots_between(a, z);
+                if a > z {
+                    knots.reverse();
+                }
+                stops.extend(knots);
+            } else {
+                let turns = ((z - a).abs() / (hi - lo).max(1e-300)).min(4.0);
+                let n = (turns * (c.points.len() as f64)).ceil().clamp(1.0, 512.0) as usize;
+                stops.extend((1..n).map(|k| a + (z - a) * k as f64 / n as f64));
+            }
+            stops.push(z);
+            let parts = if c.degree == 1 { 1 } else { (2048 / stops.len()).clamp(1, 8) };
+            let mut pts: Vec<V3> = vec![s];
+            for w in stops.windows(2) {
+                for k in 1..=parts {
+                    pts.push(c.eval(w[0] + (w[1] - w[0]) * k as f64 / parts as f64));
+                }
+            }
+            let last = pts.len() - 1;
+            pts[last] = t;
+            let mut pts = simplify(&pts);
+            if s == t && pts.len() == 2 {
+                pts.pop();
+            }
+            Ok(pts)
+        }
         Some(Curve::Other(name)) => Err(name),
     }
 }
 
-/// Constrained Delaunay triangulation of rings in a plane; triangles inside an odd number of
-/// rings are kept. Returns triangles as indices into the concatenated ring points.
-fn triangulate(rings: &[Vec<[f64; 2]>]) -> Option<Vec<[usize; 3]>> {
+/// A polyline with the points left out that lie within a small distance (1/2000 of its
+/// length) of the line through the points kept; the ends stay.
+fn simplify(pts: &[V3]) -> Vec<V3> {
+    if pts.len() < 3 {
+        return pts.to_vec();
+    }
+    let length: f64 = pts.windows(2).map(|w| dist(w[0], w[1])).sum();
+    let tol = 5e-4 * length;
+    let mut keep = vec![false; pts.len()];
+    keep[0] = true;
+    keep[pts.len() - 1] = true;
+    // a closed curve needs a point across from its start to have a line to measure from
+    let mut stack = if pts[0] == pts[pts.len() - 1] {
+        let mid = pts.len() / 2;
+        keep[mid] = true;
+        vec![(0, mid), (mid, pts.len() - 1)]
+    } else {
+        vec![(0, pts.len() - 1)]
+    };
+    while let Some((a, z)) = stack.pop() {
+        if z <= a + 1 {
+            continue;
+        }
+        let d = sub(pts[z], pts[a]);
+        let l2 = dot(d, d);
+        let off = |p: V3| {
+            let v = sub(p, pts[a]);
+            if l2 < 1e-300 {
+                len(v)
+            } else {
+                len(sub(v, mul(d, (dot(v, d) / l2).clamp(0.0, 1.0))))
+            }
+        };
+        let (k, far) = (a + 1..z).map(|k| (k, off(pts[k]))).fold((a, 0.0), |m, c| if c.1 > m.1 { c } else { m });
+        if far > tol {
+            keep[k] = true;
+            stack.push((a, k));
+            stack.push((k, z));
+        }
+    }
+    pts.iter().zip(&keep).filter(|p| *p.1).map(|p| *p.0).collect()
+}
+
+/// A coordinate for the triangulation, which refuses numbers nearer to zero than about 1e-43
+/// (rounding leaves such numbers where zero was meant).
+fn tidy(v: f64) -> f64 {
+    if v.abs() < 1e-40 {
+        0.0
+    } else {
+        v
+    }
+}
+
+/// Constrained Delaunay triangulation of rings in a plane, together with loose points (`more`);
+/// triangles inside an odd number of rings are kept. Returns triangles as indices into the
+/// concatenated ring points followed by `more`.
+pub(crate) fn triangulate(rings: &[Vec<[f64; 2]>], more: &[[f64; 2]]) -> Option<Vec<[usize; 3]>> {
     use spade::handles::FixedVertexHandle;
     use spade::{ConstrainedDelaunayTriangulation, Point2, Triangulation};
     let mut cdt = ConstrainedDelaunayTriangulation::<Point2<f64>>::new();
@@ -338,7 +484,7 @@ fn triangulate(rings: &[Vec<[f64; 2]>]) -> Option<Vec<[usize; 3]>> {
             if !p[0].is_finite() || !p[1].is_finite() {
                 return None;
             }
-            let h = cdt.insert(Point2::new(p[0], p[1])).ok()?;
+            let h = cdt.insert(Point2::new(tidy(p[0]), tidy(p[1]))).ok()?;
             owner.entry(h.index()).or_insert(flat);
             hs.push(h);
             flat += 1;
@@ -355,6 +501,14 @@ fn triangulate(rings: &[Vec<[f64; 2]>]) -> Option<Vec<[usize; 3]>> {
                 cdt.add_constraint(a, b);
             }
         }
+    }
+    for p in more {
+        if !p[0].is_finite() || !p[1].is_finite() {
+            return None;
+        }
+        let h = cdt.insert(Point2::new(tidy(p[0]), tidy(p[1]))).ok()?;
+        owner.entry(h.index()).or_insert(flat);
+        flat += 1;
     }
     // inside/outside by crossing constraint edges from the outer face
     let mut parity: HashMap<usize, bool> = HashMap::new();
@@ -411,7 +565,7 @@ fn plane(p: V3, n: V3, u: V3, forward: bool, loops: &[Vec<V3>]) -> Option<FaceMe
                 .collect()
         })
         .collect();
-    let tris = triangulate(&rings)?;
+    let tris = triangulate(&rings, &[])?;
     let flat: Vec<[f64; 2]> = rings.concat();
     let positions: Vec<V3> = loops.concat();
     // (u, v, n) is right-handed: counter-clockwise in (u, v) faces +n
@@ -429,13 +583,13 @@ fn plane(p: V3, n: V3, u: V3, forward: bool, loops: &[Vec<V3>]) -> Option<FaceMe
             }
         })
         .collect();
-    Some(compact(FaceMesh { normals: vec![out; positions.len()], positions, triangles, known: true }))
+    Some(compact(FaceMesh { normals: vec![out; positions.len()], positions, triangles, known: true, color: None }))
 }
 
 /// Drops the vertices no triangle uses.
-fn compact(m: FaceMesh) -> FaceMesh {
+pub(crate) fn compact(m: FaceMesh) -> FaceMesh {
     let mut map = vec![u32::MAX; m.positions.len()];
-    let mut out = FaceMesh { known: m.known, ..Default::default() };
+    let mut out = FaceMesh { known: m.known, color: m.color, ..Default::default() };
     for t in &m.triangles {
         let mut nt = [0u32; 3];
         for (k, &i) in t.iter().enumerate() {
@@ -558,7 +712,7 @@ fn cone(c: V3, a: V3, m: V3, ratio: f64, sin: f64, cos: f64, forward: bool, loop
         _ => return None,
     }
     let rings2d: Vec<Vec<[f64; 2]>> = polys.iter().map(|r| r.iter().map(|&(t, v, _)| [t * mean_r, v]).collect()).collect();
-    let tris = triangulate(&rings2d)?;
+    let tris = triangulate(&rings2d, &[])?;
     let flat: Vec<(f64, f64, Option<V3>)> = polys.concat();
     let sign = if forward { 1.0 } else { -1.0 };
     let positions: Vec<V3> = flat.iter().map(|&(t, v, q)| q.unwrap_or_else(|| lift(t, v))).collect();
@@ -575,7 +729,7 @@ fn cone(c: V3, a: V3, m: V3, ratio: f64, sin: f64, cos: f64, forward: bool, loop
             Some(if dot(g, n) >= 0.0 { [i as u32, j as u32, l as u32] } else { [i as u32, l as u32, j as u32] })
         })
         .collect();
-    Some(compact(FaceMesh { positions, normals, triangles, known: false }))
+    Some(compact(FaceMesh { positions, normals, triangles, known: false, color: None }))
 }
 
 /// A point of a cone face in its parameter plane: θ, v, and the edge point it came from.

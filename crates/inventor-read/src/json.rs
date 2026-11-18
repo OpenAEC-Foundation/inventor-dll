@@ -65,7 +65,7 @@ pub fn scene(scene: &Scene) -> Json {
         "faces": scene.brep.as_ref().map(|s| json!({
             "total": s.faces, "tessellated": s.tessellated, "skipped": s.skipped(),
             "unsupported_surface": s.unsupported_surface, "unsupported_curve": s.unsupported_curve,
-            "failed": s.failed, "reoriented": s.reoriented,
+            "failed": s.failed(), "failures": s.failures, "reoriented": s.reoriented,
         })),
         "cache": scene.cache.as_ref().map(|c| json!({
             "vertex_buffers": c.vertex_buffers, "line_buffers": c.line_buffers, "invalid": c.invalid, "lods_dropped": c.lods_dropped,

@@ -15,6 +15,15 @@
 //!   number and the occurrence name as counted UTF-16 (often empty), followed by a list of
 //!   properties that starts with its count twice and property `0F`.
 //!
+//! - `DesignViewSegment`, what is shown: record 1 lists the design views and ends with the
+//!   name of the active one. A view starts with its name and lists records, among them one
+//!   per occurrence it says something about: a reference to a path record and a byte, 0 for
+//!   hidden. The path record holds `02 00 00 30`, the number of occurrence numbers, two more
+//!   words and the occurrence numbers from the assembly inwards. (Newer files have path and
+//!   byte in one record.)
+//! - `UFRxDoc`, what is suppressed: after the counted text `[Primary]` and two words, a count
+//!   and the occurrence numbers as counted texts of digits, each followed by seven bytes.
+//!
 //! Lengths are in centimetres, as in the B-rep.
 
 use crate::bytes::Rd;
@@ -60,6 +69,10 @@ pub struct Occurrence {
     pub file: Option<usize>,
     /// Occurrence space to assembly space.
     pub matrix: Matrix,
+    /// The name of the appearance the occurrence is shown in, when it has one of its own.
+    pub appearance: Option<String>,
+    /// Shown in the active design view and not suppressed.
+    pub visible: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -68,6 +81,9 @@ pub struct Assembly {
     pub occurrences: Vec<Occurrence>,
     /// Occurrence records that could not be read.
     pub unreadable: usize,
+    /// Occurrences inside subassemblies that the active design view hides: the occurrence
+    /// numbers from this assembly inwards.
+    pub hidden_inside: Vec<Vec<u32>>,
 }
 
 /// The compact matrix of an occurrence: two `u16` masks, then a `f64` for every entry that
@@ -107,7 +123,7 @@ fn reference(body: &[u8], at: usize) -> Option<usize> {
 
 /// The occurrences of `AmRxSegment`: (occurrence number, matrix); `None` for a record that is
 /// not as described.
-fn placements(records: &[Record]) -> Result<Vec<Option<(u32, Matrix)>>, String> {
+fn placements(records: &[Record]) -> Result<Vec<Option<(u32, Matrix, Option<String>)>>, String> {
     let root = records.first().ok_or("no records")?.body;
     if root.len() < 18 || root[..2] != [1, 0] || root[2..6] != [2, 0, 0, 0x30] {
         return Err("the list of occurrences is not as expected".into());
@@ -126,9 +142,23 @@ fn placements(records: &[Record]) -> Result<Vec<Option<(u32, Matrix)>>, String> 
                 return None;
             }
             let start = if body.get(6..10)? == [3, 2, 0, 0] { 10 } else { 6 };
-            Some((id, compact_matrix(&mut Rd::at(body, start))?))
+            Some((id, compact_matrix(&mut Rd::at(body, start))?, descriptor_appearance(descriptor)))
         })
         .collect())
+}
+
+/// The appearance of an occurrence: the first counted text of its descriptor behind the two
+/// 16-byte ids that follow `AmRx` (newer files; older descriptors end before it).
+fn descriptor_appearance(descriptor: &[u8]) -> Option<String> {
+    (58..descriptor.len().saturating_sub(8)).find_map(|at| {
+        let mut r = Rd::at(descriptor, at);
+        let s = text(&mut r, 96)?;
+        // a text of letters, not a number that happens to be followed by enough bytes
+        (s.chars().count() >= 3
+            && s.chars().filter(|c| c.is_alphabetic()).count() >= 3
+            && s.chars().all(|c| c as u32 >= 0x20 && c as u32 != 0xFFFD && (c as u32) < 0x3000))
+        .then_some(s)
+    })
 }
 
 /// A counted UTF-16 text of at most `max` characters without control characters.
@@ -215,9 +245,90 @@ fn links(ufrx: &[u8], files: &HashSet<u32>, ids: &HashSet<u32>) -> HashMap<u32, 
     out
 }
 
-/// The files and occurrences of an assembly from its unpacked `AmRxSegment` and its
-/// `UFRxDoc` stream.
-pub fn read(amrx: &[u8], ufrx: &[u8]) -> Result<Assembly, String> {
+/// The occurrences the active design view hides, as paths of occurrence numbers from the
+/// assembly inwards, from the unpacked `DesignViewSegment`.
+pub fn hidden(design_views: &[u8]) -> Vec<Vec<u32>> {
+    let Some(records) = records::frame(design_views) else { return Vec::new() };
+    let record = |n: usize| records.get(n - 1).map(|r| r.body);
+    // a counted list: `02 00 00 30`, count, capacity, a word, the references
+    let list = |body: &[u8], at: usize| -> Option<(Vec<usize>, usize)> {
+        if body.get(at..at + 4)? != [2, 0, 0, 0x30] {
+            return None;
+        }
+        let count = Rd::at(body, at + 4).u32()? as usize;
+        if count > records.len() {
+            return None;
+        }
+        let refs = (0..count).map(|k| reference(body, at + 16 + 4 * k)).collect::<Option<Vec<usize>>>()?;
+        Some((refs, at + 16 + 4 * count))
+    };
+    let view = (|| {
+        let root = records.first()?.body;
+        let (views, end) = list(root, 2)?;
+        let active = text(&mut Rd::at(root, end), 256)?;
+        // the view of that name, else the first
+        let named = views.iter().find(|&&v| record(v).and_then(|b| text(&mut Rd::at(b, 2), 256)).as_deref() == Some(active.as_str()));
+        record(*named.or(views.first())?)
+    })();
+    let Some(view) = view else { return Vec::new() };
+    let mut name = Rd::at(view, 2);
+    if text(&mut name, 256).is_none() {
+        return Vec::new();
+    }
+    let Some((entries, _)) = list(view, name.p) else { return Vec::new() };
+    // the occurrence numbers of a path at `at`: `02 00 00 30`, count, two words, the numbers
+    let path = |body: &[u8], at: usize| -> Option<(Vec<u32>, usize)> {
+        if body.get(at..at + 4)? != [2, 0, 0, 0x30] {
+            return None;
+        }
+        let mut r = Rd::at(body, at + 4);
+        let count = r.u32()? as usize;
+        r.skip(8)?;
+        if count == 0 || count > 64 {
+            return None;
+        }
+        let ids = (0..count).map(|_| r.u32()).collect::<Option<Vec<u32>>>()?;
+        Some((ids, r.p))
+    };
+    let mut out = Vec::new();
+    for entry in entries {
+        let Some(body) = record(entry) else { continue };
+        let found = if body.len() == 7 {
+            // a reference to the path record and the byte
+            reference(body, 2).and_then(record).and_then(|p| path(p, 2)).map(|(ids, _)| (ids, body[6]))
+        } else {
+            // the path and the byte in one record
+            path(body, 2).filter(|(_, end)| *end + 1 == body.len()).map(|(ids, end)| (ids, body[end]))
+        };
+        if let Some((ids, 0)) = found {
+            out.push(ids);
+        }
+    }
+    out
+}
+
+/// The suppressed occurrences of `UFRxDoc`.
+pub fn suppressed(ufrx: &[u8]) -> HashSet<u32> {
+    let mut marker = 9u32.to_le_bytes().to_vec();
+    marker.extend("[Primary]".encode_utf16().flat_map(u16::to_le_bytes));
+    marker.extend([2, 0, 0, 0, 0, 0, 0, 0]);
+    let mut out = HashSet::new();
+    let Some(at) = ufrx.windows(marker.len()).position(|w| w == marker) else { return out };
+    let mut r = Rd::at(ufrx, at + marker.len());
+    let count = r.u32().unwrap_or(0);
+    for _ in 0..count.min(100_000) {
+        let Some(id) = text(&mut r, 10).and_then(|t| t.parse::<u32>().ok()) else { break };
+        if r.bytes(7) != Some(&[1, 0, 0, 0, 0, 0, 0]) {
+            break;
+        }
+        out.insert(id);
+    }
+    out
+}
+
+/// The files and occurrences of an assembly from its unpacked `AmRxSegment`, its `UFRxDoc`
+/// stream and, for what is hidden, its unpacked `DesignViewSegment`.
+pub fn read(amrx: &[u8], ufrx: &[u8], design_views: Option<&[u8]>) -> Result<Assembly, String> {
     let records = records::frame(amrx).ok_or("the records of the occurrence segment could not be told apart")?;
     let placements = placements(&records)?;
     let files = files(ufrx);
@@ -225,10 +336,12 @@ pub fn read(amrx: &[u8], ufrx: &[u8]) -> Result<Assembly, String> {
     let ids: HashSet<u32> = placements.iter().flatten().map(|p| p.0).collect();
     let links = links(ufrx, &file_ids, &ids);
     let unreadable = placements.iter().filter(|p| p.is_none()).count();
+    let hidden = design_views.map(hidden).unwrap_or_default();
+    let suppressed = suppressed(ufrx);
     let occurrences = placements
         .into_iter()
         .flatten()
-        .map(|(id, matrix)| {
+        .map(|(id, matrix, appearance)| {
             let link = links.get(&id);
             let file = link.and_then(|l| files.iter().position(|f| f.id == l.0));
             let name = match (link, file) {
@@ -236,10 +349,12 @@ pub fn read(amrx: &[u8], ufrx: &[u8]) -> Result<Assembly, String> {
                 (Some((_, instance, _)), Some(f)) => format!("{}:{instance}", stem(files[f].file_name())),
                 _ => format!("Occurrence {id}"),
             };
-            Occurrence { id, name, file, matrix }
+            let visible = !suppressed.contains(&id) && !hidden.iter().any(|h| h.as_slice() == [id]);
+            Occurrence { id, name, file, matrix, appearance, visible }
         })
         .collect();
-    Ok(Assembly { files, occurrences, unreadable })
+    let hidden_inside = hidden.into_iter().filter(|h| h.len() > 1).collect();
+    Ok(Assembly { files, occurrences, unreadable, hidden_inside })
 }
 
 /// A file name without its extension.
@@ -342,7 +457,7 @@ mod tests {
             ufrx.extend(words(&[14, 14]));
             ufrx.extend([1, 0x0F, 1, 0, 0, 0, 0x0F, 0, 0, 0, 0, 0, 0]);
         }
-        let a = read(&amrx, &ufrx).unwrap();
+        let a = read(&amrx, &ufrx, None).unwrap();
         assert_eq!(a.files.len(), 2);
         assert_eq!((a.files[0].id, a.files[0].file_name(), a.files[0].relative.as_deref(), a.files[0].occurrences), (1, "Leg.ipt", Some("parts\\Leg.ipt"), 2));
         assert_eq!((a.files[1].id, a.files[1].display_name.as_str(), a.files[1].relative.as_deref()), (3, "Bolt M4", None));
@@ -362,12 +477,97 @@ mod tests {
             d.extend([0xFF, 0xFF, 0xFF, 0xFF, 2, 0, 2, 0, 0, 0]);
             d
         };
-        assert_eq!(read(&old, &ufrx).unwrap(), a);
+        assert_eq!(read(&old, &ufrx, None).unwrap(), a);
 
         // an occurrence the file list does not name stays, without a file
-        let a = read(&segment(&[(1, 0.0), (77, 0.0)]), &ufrx).unwrap();
+        let a = read(&segment(&[(1, 0.0), (77, 0.0)]), &ufrx, None).unwrap();
         assert_eq!(a.occurrences[1].file, None);
-        assert!(read(&[1, 2, 3], &ufrx).is_err());
+        assert!(read(&[1, 2, 3], &ufrx, None).is_err());
+    }
+
+    /// Records with separators and a trailer.
+    fn framed(bodies: &[Vec<u8>]) -> Vec<u8> {
+        let mut d = Vec::new();
+        for (k, b) in bodies.iter().enumerate() {
+            d.extend([k as u8, 1, 0, 0, 0, 0, 0, 0]);
+            d.extend(b);
+            d.extend((b.len() as u32 + 4).to_le_bytes());
+            d.push(0);
+        }
+        d.extend([0xFF, 0xFF, 0xFF, 0xFF, 1, 0, 1, 0, 0, 0]);
+        d
+    }
+
+    #[test]
+    fn hidden_and_suppressed_occurrences() {
+        let reference = |n: u32| (0x8000_0000 | n).to_le_bytes();
+        let listed = |refs: &[u32]| {
+            let mut d = vec![2, 0, 0, 0x30];
+            d.extend(words(&[refs.len() as u32, refs.len() as u32, 16]));
+            d.extend(refs.iter().flat_map(|&n| reference(n)));
+            d
+        };
+        let view = |name: &str, refs: &[u32]| {
+            let mut d = vec![2, 0];
+            d.extend(counted(name));
+            d.extend(listed(refs));
+            d
+        };
+        let entry = |path: u32, shown: u8| {
+            let mut d = vec![5, 0];
+            d.extend(reference(path));
+            d.push(shown);
+            d
+        };
+        let path = |ids: &[u32]| {
+            let mut d = vec![6, 0, 2, 0, 0, 0x30];
+            d.extend(words(&[ids.len() as u32, 7, 8]));
+            d.extend(words(ids));
+            d.extend([0x21, 0x84, 0xDE, 0x7B]);
+            d
+        };
+        // record 1: the views (2 and 3) and the active one, "Open"
+        let mut root = vec![1, 0];
+        root.extend(listed(&[2, 3]));
+        root.extend(counted("Open"));
+        let bodies = vec![
+            root,
+            view("Default", &[4, 5]),
+            view("Open", &[4, 6, 7, 8]),
+            vec![9; 30],    // 4: something else of a view
+            entry(9, 0),    // 5: occurrence 1 hidden, in the view that is not active
+            entry(10, 0),   // 6: occurrence 6 hidden
+            entry(9, 1),    // 7: occurrence 1 shown
+            entry(11, 0),   // 8: occurrence 7 inside occurrence 11 hidden
+            path(&[1]),     // 9
+            path(&[6]),     // 10
+            path(&[11, 7]), // 11
+        ];
+        assert_eq!(hidden(&framed(&bodies)), vec![vec![6], vec![11, 7]]);
+        // path and byte in one record
+        let mut inline = vec![5, 0, 2, 0, 0, 0x30];
+        inline.extend(words(&[1, 7, 8, 12]));
+        inline.push(0);
+        let mut root = vec![1, 0];
+        root.extend(listed(&[2]));
+        root.extend(counted("Default"));
+        assert_eq!(hidden(&framed(&[root, view("Default", &[3]), inline])), vec![vec![12]]);
+        assert!(hidden(&[1, 2, 3]).is_empty());
+
+        let mut ufrx = vec![3u8; 9];
+        ufrx.extend(counted("[Primary]"));
+        ufrx.extend(words(&[2, 0, 2]));
+        for id in ["4", "12"] {
+            ufrx.extend(counted(id));
+            ufrx.extend([1, 0, 0, 0, 0, 0, 0]);
+        }
+        assert_eq!(suppressed(&ufrx), HashSet::from([4, 12]));
+        assert!(suppressed(&[0; 40]).is_empty());
+
+        // both reach the occurrences
+        let a = read(&segment(&[(1, 0.0), (4, 0.0), (6, 0.0)]), &ufrx, Some(&framed(&bodies))).unwrap();
+        assert_eq!(a.occurrences.iter().map(|o| o.visible).collect::<Vec<_>>(), vec![true, false, false]);
+        assert_eq!(a.hidden_inside, vec![vec![11, 7]]);
     }
 
     #[test]

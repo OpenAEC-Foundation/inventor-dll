@@ -91,6 +91,9 @@ fn info(doc: &Document, path: &str) -> Result<(), String> {
     for r in &doc.references {
         println!("Reference: {r}");
     }
+    for (id, a, b) in doc.body_display() {
+        println!("Body {id}: display bytes {a:02x} {b:02x}");
+    }
     if doc.kind == inventor_read::DocumentKind::Assembly {
         match doc.assembly() {
             Ok(a) => {
@@ -99,7 +102,8 @@ fn info(doc: &Document, path: &str) -> Result<(), String> {
                 }
                 for o in &a.occurrences {
                     let file = o.file.map(|f| a.files[f].file_name()).unwrap_or("?");
-                    println!("Occurrence {} {:?}: {file} at ({:.3}, {:.3}, {:.3}) cm", o.id, o.name, o.matrix[0][3], o.matrix[1][3], o.matrix[2][3]);
+                    let hidden = if o.visible { "" } else { " (hidden)" };
+                    println!("Occurrence {} {:?}: {file} at ({:.3}, {:.3}, {:.3}) cm{hidden}", o.id, o.name, o.matrix[0][3], o.matrix[1][3], o.matrix[2][3]);
                 }
             }
             Err(e) => println!("Occurrences: {e}"),
@@ -220,7 +224,7 @@ fn one(path: &std::path::Path) -> Line {
     match scene(&doc, &path.to_string_lossy()) {
         Ok(s) => {
             if let Some(p) = &s.parts {
-                line.parts = format!("{}/{} parts", p.shown, p.occurrences);
+                line.parts = format!("{}/{} parts{}", p.shown, p.occurrences, if p.hidden > 0 { format!(" ({} hidden)", p.hidden) } else { String::new() });
             }
             line.source = format!("{:?}", s.source);
             line.triangles = s.meshes.iter().map(|m| m.triangle_count()).sum();
@@ -229,9 +233,7 @@ fn one(path: &std::path::Path) -> Line {
                 line.shown = b.tessellated;
                 line.skipped.extend(b.unsupported_surface.iter().map(|(k, v)| (k.clone(), *v)));
                 line.skipped.extend(b.unsupported_curve.iter().map(|(k, v)| (k.clone(), *v)));
-                if b.failed > 0 {
-                    line.skipped.push(("failed".into(), b.failed));
-                }
+                line.skipped.extend(b.failures.iter().map(|(k, v)| (format!("failed: {k}"), *v)));
             }
             let parts_left_out = s.parts.as_ref().is_some_and(|p| p.shown < p.occurrences);
             line.status = if line.triangles == 0 {

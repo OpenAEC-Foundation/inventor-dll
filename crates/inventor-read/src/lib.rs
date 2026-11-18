@@ -14,14 +14,17 @@
 //! # Ok::<(), inventor_read::Error>(())
 //! ```
 
+pub mod appearance;
 pub mod assembly;
 pub mod brep;
 mod bytes;
 pub mod json;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod locate;
+pub mod nurbs;
 pub mod ogs;
 pub mod oleps;
+mod param;
 pub mod props;
 pub mod records;
 pub mod refs;
@@ -66,7 +69,7 @@ impl std::fmt::Display for Error {
             Error::Format(e) => write!(f, "damaged or unsupported Inventor file: {e}"),
             Error::NoDisplayCache { references } => write!(
                 f,
-                "this Inventor assembly has no display cache (CacheGraphics); showing assemblies from their part files is not supported yet ({references} referenced files)"
+                "this Inventor assembly has no display cache (CacheGraphics); it is shown from its part files, which were not given here ({references} referenced files)"
             ),
             Error::Unsupported(e) => write!(f, "{e}"),
         }
@@ -156,6 +159,9 @@ pub struct Mesh {
     pub indices: Vec<u32>,
     /// The colour of the mesh (red, green, blue, 0 to 1), when the file gives one.
     pub color: Option<[f32; 3]>,
+    /// The number of the body in its part (from 0); a body with faces in several colours has a
+    /// mesh for each.
+    pub body: u32,
     /// In an assembly shown from its part files: the file name of the part.
     pub part: Option<String>,
     /// In an assembly shown from its part files: the number of the placed part (from 1); the
@@ -163,6 +169,9 @@ pub struct Mesh {
     pub instance: Option<u32>,
     /// In an assembly shown from its part files: the iProperties of the part.
     pub properties: Vec<(&'static str, String)>,
+    /// In an assembly shown from its part files: the occurrence numbers from the assembly
+    /// inwards to the placed part.
+    pub occurrence: Vec<u32>,
 }
 
 impl Mesh {
@@ -198,6 +207,8 @@ pub struct PartsStats {
     pub unlinked: usize,
     /// Occurrence records that could not be read.
     pub unreadable: usize,
+    /// Placed parts and subassemblies left out because the assembly hides or suppresses them.
+    pub hidden: usize,
     /// File names that were asked for and not given.
     pub missing: Vec<String>,
     /// File names that were given and could not be read, with the reason.
@@ -329,6 +340,31 @@ impl Document {
         brep::parse(&data).map_err(Error::Format)
     }
 
+    /// What the graphics segment of a part says about each body: the number of the body (as in
+    /// its B-rep record) and two bytes of its display record, at +19 and at +32.
+    pub fn body_display(&self) -> Vec<(i32, u8, u8)> {
+        /// The class of the display record of a body.
+        const BODY: [u8; 16] = [0x50, 0x6a, 0x67, 0x9a, 0xd4, 0x11, 0xa6, 0x5d, 0x60, 0x00, 0xe3, 0xb8, 0x12, 0x69, 0xf1, 0xb0];
+        let Some(segment) = self.segments.iter().find(|s| s.class.eq_ignore_ascii_case("PmGraphicsSegment")) else { return Vec::new() };
+        let found = (|| {
+            let meta = segments::meta_unpack(&self.stream(&segment.data_path.replace("/RSeStorage/B", "/RSeStorage/M")).ok()?)?;
+            let class = segments::classes(&meta)?.iter().position(|c| *c == BODY)? as u16 + 0x100;
+            let data = self.segment_data(segment).ok()?;
+            let records = records::frame(&data)?;
+            Some(
+                records
+                    .iter()
+                    .filter(|r| r.class() == class && r.body.len() >= 48)
+                    .map(|r| {
+                        let at = r.body.len() - 12;
+                        (i32::from_le_bytes([r.body[at], r.body[at + 1], r.body[at + 2], r.body[at + 3]]), r.body[19], r.body[32])
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })();
+        found.unwrap_or_default()
+    }
+
     /// The kernel version of the B-rep (e.g. 228), from its header (SPEC §4.1, §8).
     pub fn kernel_version(&self) -> Option<i32> {
         self.brep().ok().map(|b| b.kernel_major())
@@ -348,20 +384,49 @@ impl Document {
             .ok_or_else(|| Error::Format("no occurrence segment (AmRxSegment)".into()))?;
         let amrx = self.segment_data(segment)?;
         let ufrx = self.stream("/UFRxDoc")?;
-        assembly::read(&amrx, &ufrx).map_err(|e| Error::Format(format!("assembly: {e}")))
+        let views = self.segments.iter().find(|s| s.class.eq_ignore_ascii_case("DesignViewSegment")).and_then(|s| self.segment_data(s).ok());
+        assembly::read(&amrx, &ufrx, views.as_deref()).map_err(|e| Error::Format(format!("assembly: {e}")))
     }
 
-    /// As `scene_with`, and an assembly without a (filled) display cache is put together from
-    /// its part files: `fetch` gives the bytes of a referenced file, or `None` when it is not
-    /// there. Each part is tessellated once and placed where its occurrences stand;
-    /// subassemblies are opened up the same way.
+    /// As `scene_with`, and an assembly is put together from its part files: `fetch` gives the
+    /// bytes of a referenced file, or `None` when it is not there. Each part is tessellated once
+    /// and placed where its occurrences stand; subassemblies are opened up the same way. The
+    /// display cache of the assembly is taken instead when it has one and part files are
+    /// missing (or first of all, with `Options::parts_first` off): the cache shows every part,
+    /// but as loose meshes without their names.
     pub fn scene_with_parts(&self, opt: &Options, fetch: &mut Fetch) -> Result<Scene> {
         if self.kind != DocumentKind::Assembly {
             return self.scene_with(opt);
         }
-        if let Some(scene) = self.filled_cache() {
-            return Ok(scene);
+        let cached = self.filled_cache();
+        if !opt.parts_first {
+            if let Some(scene) = cached {
+                return Ok(scene);
+            }
+            return self.parts_scene(opt, fetch);
         }
+        match (self.parts_scene(opt, fetch), cached) {
+            (Ok(parts), Some(mut cache)) => {
+                let stats = parts.parts.as_ref();
+                let complete = stats.is_some_and(|p| p.missing.is_empty() && p.failed.is_empty() && p.unlinked + p.unreadable == 0) && !parts.meshes.is_empty();
+                if complete {
+                    return Ok(parts);
+                }
+                if let Some(p) = stats.filter(|p| !p.missing.is_empty()) {
+                    cache
+                        .warnings
+                        .push(format!("Inventor: shown from the display cache of the assembly, as {} of its part files were not found", p.missing.len()));
+                }
+                Ok(cache)
+            }
+            (Ok(parts), None) => Ok(parts),
+            (Err(_), Some(cache)) => Ok(cache),
+            (Err(e), None) => Err(e),
+        }
+    }
+
+    /// The assembly from its part files.
+    fn parts_scene(&self, opt: &Options, fetch: &mut Fetch) -> Result<Scene> {
         let mut walk = Walk {
             opt,
             fetch,
@@ -410,6 +475,10 @@ impl Document {
         let mut out: Vec<Mesh> = Vec::new();
         let mut triangles = 0usize;
         for occ in &asm.occurrences {
+            if !occ.visible {
+                walk.stats.hidden += 1;
+                continue;
+            }
             let Some(file) = occ.file.map(|f| &asm.files[f]) else {
                 walk.stats.occurrences += 1;
                 walk.stats.unlinked += 1;
@@ -433,13 +502,22 @@ impl Document {
             }
             // the placed parts inside a subassembly get numbers of their own per placement
             let mut renumbered: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+            // what this assembly hides inside the subassembly: paths below this occurrence
+            let hidden: Vec<&[u32]> = asm.hidden_inside.iter().filter(|h| h[0] == occ.id).map(|h| &h[1..]).collect();
             for m in meshes.iter() {
+                if hidden.iter().any(|h| m.occurrence.starts_with(h)) {
+                    continue;
+                }
                 triangles += m.triangle_count();
                 if triangles > MAX_ASSEMBLY_TRIANGLES {
                     walk.warnings.push("Inventor: the assembly has more triangles than this reader shows; the rest is left out".into());
                     return Ok(out);
                 }
                 let mut placed = place(m, &occ.matrix);
+                placed.occurrence.insert(0, occ.id);
+                if let Some(colour) = occ.appearance.as_deref().and_then(appearance::from_name) {
+                    placed.color = Some(colour);
+                }
                 if is_assembly {
                     placed.name = format!("{}/{}", occ.name, m.name);
                     let next = &mut walk.instances;
@@ -488,17 +566,32 @@ impl Document {
         };
         let properties = doc.iproperties.rows();
         let result = if doc.kind == DocumentKind::Assembly {
-            if let Some(scene) = doc.filled_cache() {
-                // the saved picture of the subassembly: its parts are not told apart
-                return Ok(scene
-                    .meshes
-                    .into_iter()
-                    .map(|m| Mesh { part: Some(name.clone()), instance: Some(0), properties: properties.clone(), ..m })
-                    .collect());
+            // the saved picture of the subassembly: its parts are not told apart
+            let cached = |doc: &Document| -> Option<Vec<Mesh>> {
+                let scene = doc.filled_cache()?;
+                Some(scene.meshes.into_iter().map(|m| Mesh { part: Some(name.clone()), instance: Some(0), properties: properties.clone(), ..m }).collect())
+            };
+            if !walk.opt.parts_first {
+                if let Some(meshes) = cached(&doc) {
+                    return Ok(meshes);
+                }
             }
+            let (missing, failed, unlinked) = (walk.stats.missing.len(), walk.stats.failed.len(), walk.stats.unlinked + walk.stats.unreadable);
             walk.stack.push(key.to_string());
             let inner = doc.placed(walk);
             walk.stack.pop();
+            let complete = inner.as_ref().is_ok_and(|m| !m.is_empty())
+                && walk.stats.missing.len() == missing
+                && walk.stats.failed.len() == failed
+                && walk.stats.unlinked + walk.stats.unreadable == unlinked;
+            if !complete && walk.opt.parts_first {
+                if let Some(meshes) = cached(&doc) {
+                    // what its own picture shows is not missing
+                    walk.stats.missing.truncate(missing);
+                    walk.stats.failed.truncate(failed);
+                    return Ok(meshes);
+                }
+            }
             inner
         } else {
             doc.part_scene(walk.opt).map(|scene| {
@@ -529,14 +622,31 @@ impl Document {
         let scale = brep.mm_per_unit;
         let bodies = brep.bodies();
         let base = self.iproperties.part_number.clone().unwrap_or_else(|| "Body".into());
+        // the colour of the part as far as the name of its appearance tells it
+        let own = [&self.iproperties.appearance, &self.iproperties.color_style].into_iter().flatten().find_map(|n| appearance::from_name(n));
         let mut stats = tess::Stats::default();
         let mut meshes = Vec::new();
         let mut used = std::collections::HashSet::new();
         for (k, &body) in bodies.iter().enumerate() {
             let (faces, s) = tess::body(&brep, body, opt, &mut used);
             stats.merge(&s);
-            let mut m = Mesh { name: if bodies.len() > 1 { format!("{base} ({})", k + 1) } else { base.clone() }, ..Default::default() };
+            // one mesh per colour of the body: faces with a colour of their own, and the rest
+            let mut by_colour: Vec<Mesh> = Vec::new();
             for f in faces {
+                let colour = f.color.or(own);
+                let at = match by_colour.iter().position(|m| m.color == colour) {
+                    Some(at) => at,
+                    None => {
+                        by_colour.push(Mesh {
+                            name: if bodies.len() > 1 { format!("{base} ({})", k + 1) } else { base.clone() },
+                            color: colour,
+                            body: k as u32,
+                            ..Default::default()
+                        });
+                        by_colour.len() - 1
+                    }
+                };
+                let m = &mut by_colour[at];
                 let first = m.vertex_count() as u32;
                 for (p, n) in f.positions.iter().zip(&f.normals) {
                     m.positions.extend(p.map(|v| (v * scale) as f32));
@@ -544,9 +654,7 @@ impl Document {
                 }
                 m.indices.extend(f.triangles.iter().flatten().map(|i| i + first));
             }
-            if !m.indices.is_empty() {
-                meshes.push(m);
-            }
+            meshes.extend(by_colour.into_iter().filter(|m| !m.indices.is_empty()));
         }
         let mut warnings = self.warnings.clone();
         if bodies.is_empty() {
