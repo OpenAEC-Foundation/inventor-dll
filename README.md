@@ -215,7 +215,7 @@ Of the 995 parts every one opens: 963 with all their faces, 16 with faces left o
 surfaces of threads, a few cylinder faces whose single loop runs around the surface in steps),
 16 that hold no body. Of the 458 assemblies 415 are shown whole, 25 with something left out
 (part files that are not in the repository or hold no geometry, the faces above) and 18 are
-empty templates. Of 1 172 699 faces 1 172 433 are shown. Not checked against Inventor itself:
+empty templates. Of 1 172 697 faces 1 172 433 are shown. Not checked against Inventor itself:
 the pictures were compared by eye with the thumbnails in the files, for a handful of them. In
 one assembly the display cache held the parts of a subassembly away from their place; put
 together from its part files the same assembly is right, which is why the part files go first.
