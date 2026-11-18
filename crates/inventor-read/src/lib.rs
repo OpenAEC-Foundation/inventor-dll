@@ -14,12 +14,16 @@
 //! # Ok::<(), inventor_read::Error>(())
 //! ```
 
+pub mod assembly;
 pub mod brep;
 mod bytes;
 pub mod json;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod locate;
 pub mod ogs;
 pub mod oleps;
 pub mod props;
+pub mod records;
 pub mod refs;
 pub mod segments;
 #[cfg(feature = "synth")]
@@ -150,6 +154,15 @@ pub struct Mesh {
     pub normals: Vec<f32>,
     /// Triangle list.
     pub indices: Vec<u32>,
+    /// The colour of the mesh (red, green, blue, 0 to 1), when the file gives one.
+    pub color: Option<[f32; 3]>,
+    /// In an assembly shown from its part files: the file name of the part.
+    pub part: Option<String>,
+    /// In an assembly shown from its part files: the number of the placed part (from 1); the
+    /// bodies of one placed part share it.
+    pub instance: Option<u32>,
+    /// In an assembly shown from its part files: the iProperties of the part.
+    pub properties: Vec<(&'static str, String)>,
 }
 
 impl Mesh {
@@ -170,6 +183,25 @@ pub enum MeshSource {
     Brep,
     /// The assembly's display cache (SPEC §5).
     DisplayCache,
+    /// The part files of the assembly, each tessellated and placed.
+    Parts,
+}
+
+/// What became of the placed parts of an assembly shown from its part files.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct PartsStats {
+    /// Placed parts, those inside subassemblies included.
+    pub occurrences: usize,
+    /// Of those, shown.
+    pub shown: usize,
+    /// Occurrences whose file the assembly does not name in a way this reader follows.
+    pub unlinked: usize,
+    /// Occurrence records that could not be read.
+    pub unreadable: usize,
+    /// File names that were asked for and not given.
+    pub missing: Vec<String>,
+    /// File names that were given and could not be read, with the reason.
+    pub failed: Vec<String>,
 }
 
 /// The meshes of a document and what was left out.
@@ -182,7 +214,34 @@ pub struct Scene {
     pub brep: Option<tess::Stats>,
     /// Buffers of the display cache (assemblies).
     pub cache: Option<ogs::CacheStats>,
+    /// Placed parts (assemblies shown from their part files).
+    pub parts: Option<PartsStats>,
 }
+
+/// The meshes of one referenced file in its own coordinates; `Err` when there are none.
+type Fetched = std::rc::Rc<std::result::Result<Vec<Mesh>, ()>>;
+
+/// Gives the bytes of a referenced file, or `None` when it is not there.
+pub type Fetch<'a> = dyn FnMut(&assembly::FileRef) -> Option<Vec<u8>> + 'a;
+
+/// The state of one walk through an assembly and its subassemblies.
+struct Walk<'a, 'b> {
+    opt: &'a Options,
+    fetch: &'a mut Fetch<'b>,
+    /// Lower-case file name → its meshes.
+    files: std::collections::HashMap<String, Fetched>,
+    /// The assemblies being opened, outermost first (lower-case file names).
+    stack: Vec<String>,
+    stats: PartsStats,
+    brep: tess::Stats,
+    instances: u32,
+    warnings: Vec<String>,
+}
+
+/// Subassemblies nested deeper than this are left out.
+const MAX_DEPTH: usize = 24;
+/// More triangles than this in one assembly are left out.
+const MAX_ASSEMBLY_TRIANGLES: usize = 40_000_000;
 
 impl Document {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -251,6 +310,12 @@ impl Document {
         read_stream(&mut file, path).map_err(|e| Error::Format(format!("{path}: {e}")))
     }
 
+    /// The paths of every stream in the compound file.
+    pub fn stream_paths(&self) -> Vec<String> {
+        let Ok(file) = self.file.lock() else { return Vec::new() };
+        file.walk().filter(|e| e.is_stream()).map(|e| e.path().to_string_lossy().replace('\\', "/")).collect()
+    }
+
     /// The unpacked content of a segment.
     pub fn segment_data(&self, segment: &Segment) -> Result<Vec<u8>> {
         let b = self.stream(&segment.data_path)?;
@@ -272,6 +337,178 @@ impl Document {
     /// The meshes with default options.
     pub fn scene(&self) -> Result<Scene> {
         self.scene_with(&Options::default())
+    }
+
+    /// The referenced files and the placed parts of an assembly.
+    pub fn assembly(&self) -> Result<assembly::Assembly> {
+        let segment = self
+            .segments
+            .iter()
+            .find(|s| s.class.eq_ignore_ascii_case("AmRxSegment"))
+            .ok_or_else(|| Error::Format("no occurrence segment (AmRxSegment)".into()))?;
+        let amrx = self.segment_data(segment)?;
+        let ufrx = self.stream("/UFRxDoc")?;
+        assembly::read(&amrx, &ufrx).map_err(|e| Error::Format(format!("assembly: {e}")))
+    }
+
+    /// As `scene_with`, and an assembly without a (filled) display cache is put together from
+    /// its part files: `fetch` gives the bytes of a referenced file, or `None` when it is not
+    /// there. Each part is tessellated once and placed where its occurrences stand;
+    /// subassemblies are opened up the same way.
+    pub fn scene_with_parts(&self, opt: &Options, fetch: &mut Fetch) -> Result<Scene> {
+        if self.kind != DocumentKind::Assembly {
+            return self.scene_with(opt);
+        }
+        if let Some(scene) = self.filled_cache() {
+            return Ok(scene);
+        }
+        let mut walk = Walk {
+            opt,
+            fetch,
+            files: std::collections::HashMap::new(),
+            stack: Vec::new(),
+            stats: PartsStats::default(),
+            brep: tess::Stats::default(),
+            instances: 0,
+            warnings: self.warnings.clone(),
+        };
+        let meshes = self.placed(&mut walk)?;
+        let Walk { mut stats, brep, mut warnings, .. } = walk;
+        stats.missing.sort();
+        stats.missing.dedup();
+        stats.failed.sort();
+        stats.failed.dedup();
+        let list = |names: &[String]| {
+            let shown: Vec<&str> = names.iter().take(12).map(String::as_str).collect();
+            format!("{}{}", shown.join(", "), if names.len() > shown.len() { format!(" and {} more", names.len() - shown.len()) } else { String::new() })
+        };
+        if !stats.missing.is_empty() {
+            warnings.push(format!("Inventor: {} referenced files not found: {}", stats.missing.len(), list(&stats.missing)));
+        }
+        if !stats.failed.is_empty() {
+            warnings.push(format!("Inventor: {} referenced files could not be read: {}", stats.failed.len(), list(&stats.failed)));
+        }
+        if stats.unlinked + stats.unreadable > 0 {
+            warnings.push(format!("Inventor: {} placed parts left out (their file or placement could not be read)", stats.unlinked + stats.unreadable));
+        }
+        warnings.extend(brep.warnings());
+        Ok(Scene { source: MeshSource::Parts, meshes, warnings, brep: Some(brep), cache: None, parts: Some(stats) })
+    }
+
+    /// The display cache as a scene, when the file has one with triangles in it.
+    fn filled_cache(&self) -> Option<Scene> {
+        if !self.has_display_cache {
+            return None;
+        }
+        self.cache_scene().ok().filter(|s| s.meshes.iter().any(|m| !m.indices.is_empty()))
+    }
+
+    /// The placed parts of this assembly as meshes in its own coordinates.
+    fn placed(&self, walk: &mut Walk) -> Result<Vec<Mesh>> {
+        let asm = self.assembly()?;
+        walk.stats.unreadable += asm.unreadable;
+        let mut out: Vec<Mesh> = Vec::new();
+        let mut triangles = 0usize;
+        for occ in &asm.occurrences {
+            let Some(file) = occ.file.map(|f| &asm.files[f]) else {
+                walk.stats.occurrences += 1;
+                walk.stats.unlinked += 1;
+                continue;
+            };
+            let fetched = self.fetched(file, walk);
+            let Ok(meshes) = &*fetched else {
+                walk.stats.occurrences += 1;
+                continue;
+            };
+            let is_assembly = file.path.to_ascii_lowercase().ends_with(".iam");
+            if is_assembly {
+                // counted per placement: a subassembly placed twice shows its parts twice
+                let inner: std::collections::HashSet<u32> = meshes.iter().filter_map(|m| m.instance).collect();
+                walk.stats.occurrences += inner.len().max(1);
+                walk.stats.shown += inner.len();
+            } else {
+                walk.stats.occurrences += 1;
+                walk.stats.shown += usize::from(!meshes.is_empty());
+                walk.instances += 1;
+            }
+            // the placed parts inside a subassembly get numbers of their own per placement
+            let mut renumbered: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+            for m in meshes.iter() {
+                triangles += m.triangle_count();
+                if triangles > MAX_ASSEMBLY_TRIANGLES {
+                    walk.warnings.push("Inventor: the assembly has more triangles than this reader shows; the rest is left out".into());
+                    return Ok(out);
+                }
+                let mut placed = place(m, &occ.matrix);
+                if is_assembly {
+                    placed.name = format!("{}/{}", occ.name, m.name);
+                    let next = &mut walk.instances;
+                    placed.instance = Some(*renumbered.entry(m.instance.unwrap_or(0)).or_insert_with(|| {
+                        *next += 1;
+                        *next
+                    }));
+                } else {
+                    placed.name = occ.name.clone();
+                    placed.instance = Some(walk.instances);
+                }
+                out.push(placed);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The meshes of a referenced file, read once.
+    fn fetched(&self, file: &assembly::FileRef, walk: &mut Walk) -> Fetched {
+        let key = file.file_name().to_lowercase();
+        if let Some(done) = walk.files.get(&key) {
+            return done.clone();
+        }
+        let result = Self::fetch_meshes(file, &key, walk);
+        let result: Fetched = std::rc::Rc::new(result);
+        walk.files.insert(key, result.clone());
+        result
+    }
+
+    fn fetch_meshes(file: &assembly::FileRef, key: &str, walk: &mut Walk) -> std::result::Result<Vec<Mesh>, ()> {
+        let name = file.file_name().to_string();
+        if walk.stack.iter().any(|s| s == key) || walk.stack.len() >= MAX_DEPTH {
+            walk.stats.failed.push(format!("{name} (nested in itself or too deep)"));
+            return Err(());
+        }
+        let Some(bytes) = (walk.fetch)(file) else {
+            walk.stats.missing.push(name);
+            return Err(());
+        };
+        let doc = match Document::from_bytes(bytes) {
+            Ok(d) => d,
+            Err(e) => {
+                walk.stats.failed.push(format!("{name} ({e})"));
+                return Err(());
+            }
+        };
+        let properties = doc.iproperties.rows();
+        let result = if doc.kind == DocumentKind::Assembly {
+            if let Some(scene) = doc.filled_cache() {
+                // the saved picture of the subassembly: its parts are not told apart
+                return Ok(scene
+                    .meshes
+                    .into_iter()
+                    .map(|m| Mesh { part: Some(name.clone()), instance: Some(0), properties: properties.clone(), ..m })
+                    .collect());
+            }
+            walk.stack.push(key.to_string());
+            let inner = doc.placed(walk);
+            walk.stack.pop();
+            inner
+        } else {
+            doc.part_scene(walk.opt).map(|scene| {
+                if let Some(b) = &scene.brep {
+                    walk.brep.merge(b);
+                }
+                scene.meshes.into_iter().map(|m| Mesh { part: Some(name.clone()), properties: properties.clone(), ..m }).collect()
+            })
+        };
+        result.map_err(|e| walk.stats.failed.push(format!("{name} ({e})")))
     }
 
     /// Parts: the tessellated B-rep, one mesh per body. Assemblies: the display cache.
@@ -319,7 +556,7 @@ impl Document {
             warnings.push("Inventor: the B-rep data ends inside a record".into());
         }
         warnings.extend(stats.warnings());
-        Ok(Scene { source: MeshSource::Brep, meshes, warnings, brep: Some(stats), cache: None })
+        Ok(Scene { source: MeshSource::Brep, meshes, warnings, brep: Some(stats), cache: None, parts: None })
     }
 
     fn cache_scene(&self) -> Result<Scene> {
@@ -349,10 +586,44 @@ impl Document {
                 positions: c.positions.iter().map(|v| v * 10.0).collect(),
                 normals: c.normals,
                 indices: c.indices,
+                ..Default::default()
             })
             .collect();
-        Ok(Scene { source: MeshSource::DisplayCache, meshes, warnings, brep: None, cache: Some(stats) })
+        Ok(Scene { source: MeshSource::DisplayCache, meshes, warnings, brep: None, cache: Some(stats), parts: None })
     }
+}
+
+/// A mesh (millimetres) moved by a placement (centimetres); a mirroring placement turns the
+/// triangles so that they keep facing outwards.
+fn place(mesh: &Mesh, m: &assembly::Matrix) -> Mesh {
+    let mut out = mesh.clone();
+    for p in out.positions.chunks_exact_mut(3) {
+        let v = [f64::from(p[0]), f64::from(p[1]), f64::from(p[2])];
+        for i in 0..3 {
+            p[i] = (m[i][0] * v[0] + m[i][1] * v[1] + m[i][2] * v[2] + m[i][3] * 10.0) as f32;
+        }
+    }
+    for n in out.normals.chunks_exact_mut(3) {
+        let v = [f64::from(n[0]), f64::from(n[1]), f64::from(n[2])];
+        let mut w = [0.0f64; 3];
+        for i in 0..3 {
+            w[i] = m[i][0] * v[0] + m[i][1] * v[1] + m[i][2] * v[2];
+        }
+        let l = (w[0] * w[0] + w[1] * w[1] + w[2] * w[2]).sqrt();
+        if l > 1e-12 {
+            for i in 0..3 {
+                n[i] = (w[i] / l) as f32;
+            }
+        }
+    }
+    let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+    if det < 0.0 {
+        for t in out.indices.chunks_exact_mut(3) {
+            t.swap(1, 2);
+        }
+    }
+    out
 }
 
 fn read_stream(file: &mut cfb::CompoundFile<Cursor<Vec<u8>>>, path: &str) -> std::io::Result<Vec<u8>> {
