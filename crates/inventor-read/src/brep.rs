@@ -404,6 +404,15 @@ impl Brep {
         (0..self.records.len()).filter(|&i| self.records[i].name == "body").map(|i| i as i32).collect()
     }
 
+    /// The number of a body: the integer after the attribute pointer of its record.
+    pub fn body_number(&self, i: i32) -> Option<i32> {
+        let r = self.record(i).filter(|r| r.name == "body")?;
+        match r.fields.get(1)? {
+            Tok::Int(n) => Some(*n),
+            _ => None,
+        }
+    }
+
     pub fn body(&self, i: i32) -> Option<Body> {
         let mut f = self.typed(i, "body")?;
         Some(Body { lump: f.ptr()?, wire: f.ptr().unwrap_or(-1), transform: f.ptr().unwrap_or(-1) })

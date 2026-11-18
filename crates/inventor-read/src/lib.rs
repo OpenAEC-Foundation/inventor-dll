@@ -340,6 +340,33 @@ impl Document {
         brep::parse(&data).map_err(Error::Format)
     }
 
+    /// The bodies of a part that Inventor does not show as part of it: a body switched off
+    /// (bit 0x20 of byte +32 of its display record cleared) and a body kept as a surface
+    /// beside the solid (bit 0x01 of byte +19 set: the base body a derived part was made from,
+    /// the loose faces an imported model came with). Told only when the display records and
+    /// the bodies of the B-rep carry the same numbers, and never for all bodies.
+    fn bodies_not_shown(&self, brep: &brep::Brep) -> std::collections::HashSet<i32> {
+        let none = std::collections::HashSet::new();
+        let display = self.body_display();
+        let bodies: Vec<(i32, i32)> = brep.bodies().into_iter().filter_map(|b| Some((b, brep.body_number(b)?))).collect();
+        let numbers = |list: &mut Vec<i32>| {
+            list.sort_unstable();
+            list.dedup();
+            list.len()
+        };
+        let (mut shown, mut stored) = (display.iter().map(|d| d.0).collect::<Vec<_>>(), bodies.iter().map(|b| b.1).collect::<Vec<_>>());
+        if bodies.len() < 2 || numbers(&mut shown) != display.len() || numbers(&mut stored) != bodies.len() || shown != stored {
+            return none;
+        }
+        let off = |d: &(i32, u8, u8)| d.1 & 0x01 != 0 || (d.2 & 0x07 == 0x07 && d.2 & 0x20 == 0);
+        let hidden: std::collections::HashSet<i32> = bodies.iter().filter(|b| display.iter().any(|d| d.0 == b.1 && off(d))).map(|b| b.0).collect();
+        if hidden.len() == bodies.len() {
+            none
+        } else {
+            hidden
+        }
+    }
+
     /// What the graphics segment of a part says about each body: the number of the body (as in
     /// its B-rep record) and two bytes of its display record, at +19 and at +32.
     pub fn body_display(&self) -> Vec<(i32, u8, u8)> {
@@ -627,7 +654,12 @@ impl Document {
         let mut stats = tess::Stats::default();
         let mut meshes = Vec::new();
         let mut used = std::collections::HashSet::new();
+        let not_shown = self.bodies_not_shown(&brep);
         for (k, &body) in bodies.iter().enumerate() {
+            if not_shown.contains(&body) {
+                stats.bodies_not_shown += 1;
+                continue;
+            }
             let (faces, s) = tess::body(&brep, body, opt, &mut used);
             stats.merge(&s);
             // one mesh per colour of the body: faces with a colour of their own, and the rest

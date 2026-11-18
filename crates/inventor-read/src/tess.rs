@@ -89,8 +89,10 @@ pub struct Stats {
     pub failures: BTreeMap<String, usize>,
     /// Cone faces turned to match their planar neighbours.
     pub reoriented: usize,
-    /// Bodies with a transform record (not specified, ignored).
+    /// Bodies with a transform record that could not be read (shown untransformed).
     pub transforms_ignored: usize,
+    /// Bodies left out because Inventor does not show them as part of the part.
+    pub bodies_not_shown: usize,
 }
 
 impl Stats {
@@ -108,6 +110,7 @@ impl Stats {
         }
         self.reoriented += o.reoriented;
         self.transforms_ignored += o.transforms_ignored;
+        self.bodies_not_shown += o.bodies_not_shown;
     }
 
     pub fn skipped(&self) -> usize {
@@ -136,7 +139,7 @@ impl Stats {
             out.push(format!("Inventor: {} faces skipped (could not be tessellated: {})", self.failed(), list(&self.failures)));
         }
         if self.transforms_ignored > 0 {
-            out.push(format!("Inventor: {} bodies have a transform, which is not read yet (shown untransformed)", self.transforms_ignored));
+            out.push(format!("Inventor: {} bodies have a transform that could not be read (shown untransformed)", self.transforms_ignored));
         }
         out
     }
