@@ -32,6 +32,8 @@ pub enum Tok {
     Pos([f64; 3]),
     Vec([f64; 3]),
     Enum(i32),
+    /// `0x17`: a 64-bit integer (seen in attributes of imported parts).
+    Long(i64),
 }
 
 /// A record: its type name (`plane-surface`, `End-of-ASM-data`) and the tokens after it,
@@ -137,6 +139,7 @@ fn token(r: &mut Rd) -> Result<Option<Tok>, End> {
         0x13 => v3(r).map(Tok::Pos),
         0x14 => v3(r).map(Tok::Vec),
         0x15 => r.i32().map(Tok::Enum),
+        0x17 => r.u64().map(|v| Tok::Long(v as i64)),
         _ => return Err(End::UnknownTag),
     };
     t.map(Some).ok_or(End::Truncated)

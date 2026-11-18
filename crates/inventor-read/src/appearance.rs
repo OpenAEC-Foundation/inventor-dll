@@ -1,7 +1,7 @@
 //! Colours from what the file says about them in words. The colours of the appearances
 //! themselves (the asset library inside the file) are not read; an appearance whose name holds
-//! its colour (`Opaque(67,72,77)`, as converted models have them, or a plain colour word in
-//! English, German or Dutch) gives that colour.
+//! its colour (`Opaque(67,72,77)` or `178,125,71`, as converted models have them, or a plain
+//! colour word in English, German or Dutch) gives that colour.
 
 /// Red, green and blue from 0 to 1.
 pub type Rgb = [f32; 3];
@@ -15,6 +15,10 @@ pub fn from_triple(text: &str) -> Option<Rgb> {
 
 /// The colour an appearance name tells, if it tells one.
 pub fn from_name(name: &str) -> Option<Rgb> {
+    // nothing but the colour: 178,125,71
+    if let Some(rgb) = from_triple(name) {
+        return Some(rgb);
+    }
     // three numbers from 0 to 255 after each other: (67,72,77), RGB-51-51-51, 255 128 0
     let numbers: Vec<&str> = name.split(|c: char| !c.is_ascii_digit()).filter(|s| !s.is_empty()).collect();
     if numbers.len() == 3 && name.chars().any(|c| matches!(c, '(' | ',' | '-' | ' ')) {
@@ -57,6 +61,7 @@ mod tests {
         assert_eq!(from_triple("1,2"), None);
         assert_eq!(from_triple("1,2,300"), None);
         assert_eq!(from_name("Opaque(255,0,51)"), Some([1.0, 0.0, 0.2]));
+        assert_eq!(from_name("255,0,51"), Some([1.0, 0.0, 0.2]));
         assert_eq!(from_name("PSOLRGB-51-51-51"), Some([0.2, 0.2, 0.2]));
         assert_eq!(from_name("Glatt - Weiß"), Some([240.0 / 255.0, 240.0 / 255.0, 238.0 / 255.0]));
         assert_eq!(from_name("Rubber - Black"), from_name("Acetalharz, Schwarz"));
