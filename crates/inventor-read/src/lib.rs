@@ -213,6 +213,8 @@ pub struct PartsStats {
     pub missing: Vec<String>,
     /// File names that were given and could not be read, with the reason.
     pub failed: Vec<String>,
+    /// Part files that were read and hold no geometry.
+    pub empty: Vec<String>,
 }
 
 /// The meshes of a document and what was left out.
@@ -229,8 +231,9 @@ pub struct Scene {
     pub parts: Option<PartsStats>,
 }
 
-/// The meshes of one referenced file in its own coordinates; `Err` when there are none.
-type Fetched = std::rc::Rc<std::result::Result<Vec<Mesh>, ()>>;
+/// The meshes of one referenced file in its own coordinates, and the number of placed parts
+/// in it that have no mesh; `Err` when the file could not be had.
+type Fetched = std::rc::Rc<std::result::Result<(Vec<Mesh>, usize), ()>>;
 
 /// Gives the bytes of a referenced file, or `None` when it is not there.
 pub type Fetch<'a> = dyn FnMut(&assembly::FileRef) -> Option<Vec<u8>> + 'a;
@@ -252,7 +255,7 @@ struct Walk<'a, 'b> {
 /// Subassemblies nested deeper than this are left out.
 const MAX_DEPTH: usize = 24;
 /// More triangles than this in one assembly are left out.
-const MAX_ASSEMBLY_TRIANGLES: usize = 40_000_000;
+const MAX_ASSEMBLY_TRIANGLES: usize = 16_000_000;
 
 impl Document {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -464,12 +467,14 @@ impl Document {
             instances: 0,
             warnings: self.warnings.clone(),
         };
-        let meshes = self.placed(&mut walk)?;
+        let (meshes, not_shown) = self.placed(&mut walk)?;
         let Walk { mut stats, brep, mut warnings, .. } = walk;
-        stats.missing.sort();
-        stats.missing.dedup();
-        stats.failed.sort();
-        stats.failed.dedup();
+        stats.shown = meshes.iter().filter_map(|m| m.instance).collect::<std::collections::HashSet<u32>>().len();
+        stats.occurrences = stats.shown + not_shown;
+        for names in [&mut stats.missing, &mut stats.failed, &mut stats.empty] {
+            names.sort();
+            names.dedup();
+        }
         let list = |names: &[String]| {
             let shown: Vec<&str> = names.iter().take(12).map(String::as_str).collect();
             format!("{}{}", shown.join(", "), if names.len() > shown.len() { format!(" and {} more", names.len() - shown.len()) } else { String::new() })
@@ -483,6 +488,9 @@ impl Document {
         if stats.unlinked + stats.unreadable > 0 {
             warnings.push(format!("Inventor: {} placed parts left out (their file or placement could not be read)", stats.unlinked + stats.unreadable));
         }
+        if !stats.empty.is_empty() {
+            warnings.push(format!("Inventor: {} part files hold no geometry: {}", stats.empty.len(), list(&stats.empty)));
+        }
         warnings.extend(brep.warnings());
         Ok(Scene { source: MeshSource::Parts, meshes, warnings, brep: Some(brep), cache: None, parts: Some(stats) })
     }
@@ -495,11 +503,13 @@ impl Document {
         self.cache_scene().ok().filter(|s| s.meshes.iter().any(|m| !m.indices.is_empty()))
     }
 
-    /// The placed parts of this assembly as meshes in its own coordinates.
-    fn placed(&self, walk: &mut Walk) -> Result<Vec<Mesh>> {
+    /// The placed parts of this assembly as meshes in its own coordinates, and the number of
+    /// placed parts that have no mesh.
+    fn placed(&self, walk: &mut Walk) -> Result<(Vec<Mesh>, usize)> {
         let asm = self.assembly()?;
         walk.stats.unreadable += asm.unreadable;
         let mut out: Vec<Mesh> = Vec::new();
+        let mut not_shown = asm.unreadable;
         let mut triangles = 0usize;
         for occ in &asm.occurrences {
             if !occ.visible {
@@ -507,24 +517,21 @@ impl Document {
                 continue;
             }
             let Some(file) = occ.file.map(|f| &asm.files[f]) else {
-                walk.stats.occurrences += 1;
+                not_shown += 1;
                 walk.stats.unlinked += 1;
                 continue;
             };
             let fetched = self.fetched(file, walk);
-            let Ok(meshes) = &*fetched else {
-                walk.stats.occurrences += 1;
+            let Ok((meshes, inside)) = &*fetched else {
+                not_shown += 1;
                 continue;
             };
             let is_assembly = file.path.to_ascii_lowercase().ends_with(".iam");
             if is_assembly {
-                // counted per placement: a subassembly placed twice shows its parts twice
-                let inner: std::collections::HashSet<u32> = meshes.iter().filter_map(|m| m.instance).collect();
-                walk.stats.occurrences += inner.len().max(1);
-                walk.stats.shown += inner.len();
+                not_shown += inside;
+            } else if meshes.is_empty() {
+                not_shown += 1;
             } else {
-                walk.stats.occurrences += 1;
-                walk.stats.shown += usize::from(!meshes.is_empty());
                 walk.instances += 1;
             }
             // the placed parts inside a subassembly get numbers of their own per placement
@@ -538,7 +545,7 @@ impl Document {
                 triangles += m.triangle_count();
                 if triangles > MAX_ASSEMBLY_TRIANGLES {
                     walk.warnings.push("Inventor: the assembly has more triangles than this reader shows; the rest is left out".into());
-                    return Ok(out);
+                    return Ok((out, not_shown));
                 }
                 let mut placed = place(m, &occ.matrix);
                 placed.occurrence.insert(0, occ.id);
@@ -559,7 +566,7 @@ impl Document {
                 out.push(placed);
             }
         }
-        Ok(out)
+        Ok((out, not_shown))
     }
 
     /// The meshes of a referenced file, read once.
@@ -574,7 +581,7 @@ impl Document {
         result
     }
 
-    fn fetch_meshes(file: &assembly::FileRef, key: &str, walk: &mut Walk) -> std::result::Result<Vec<Mesh>, ()> {
+    fn fetch_meshes(file: &assembly::FileRef, key: &str, walk: &mut Walk) -> std::result::Result<(Vec<Mesh>, usize), ()> {
         let name = file.file_name().to_string();
         if walk.stack.iter().any(|s| s == key) || walk.stack.len() >= MAX_DEPTH {
             walk.stats.failed.push(format!("{name} (nested in itself or too deep)"));
@@ -594,9 +601,9 @@ impl Document {
         let properties = doc.iproperties.rows();
         let result = if doc.kind == DocumentKind::Assembly {
             // the saved picture of the subassembly: its parts are not told apart
-            let cached = |doc: &Document| -> Option<Vec<Mesh>> {
+            let cached = |doc: &Document| -> Option<(Vec<Mesh>, usize)> {
                 let scene = doc.filled_cache()?;
-                Some(scene.meshes.into_iter().map(|m| Mesh { part: Some(name.clone()), instance: Some(0), properties: properties.clone(), ..m }).collect())
+                Some((scene.meshes.into_iter().map(|m| Mesh { part: Some(name.clone()), instance: Some(0), properties: properties.clone(), ..m }).collect(), 0))
             };
             if !walk.opt.parts_first {
                 if let Some(meshes) = cached(&doc) {
@@ -607,7 +614,7 @@ impl Document {
             walk.stack.push(key.to_string());
             let inner = doc.placed(walk);
             walk.stack.pop();
-            let complete = inner.as_ref().is_ok_and(|m| !m.is_empty())
+            let complete = inner.as_ref().is_ok_and(|m| !m.0.is_empty())
                 && walk.stats.missing.len() == missing
                 && walk.stats.failed.len() == failed
                 && walk.stats.unlinked + walk.stats.unreadable == unlinked;
@@ -625,7 +632,11 @@ impl Document {
                 if let Some(b) = &scene.brep {
                     walk.brep.merge(b);
                 }
-                scene.meshes.into_iter().map(|m| Mesh { part: Some(name.clone()), properties: properties.clone(), ..m }).collect()
+                let meshes: Vec<Mesh> = scene.meshes.into_iter().map(|m| Mesh { part: Some(name.clone()), properties: properties.clone(), ..m }).collect();
+                if meshes.is_empty() {
+                    walk.stats.empty.push(name.clone());
+                }
+                (meshes, 0)
             })
         };
         result.map_err(|e| walk.stats.failed.push(format!("{name} ({e})")))

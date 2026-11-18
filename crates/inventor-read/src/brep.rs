@@ -633,4 +633,124 @@ mod tests {
         assert_eq!(b.records[1].fields, vec![Tok::Ptr(-1)]);
         assert_eq!(b.mm_per_unit, 10.0);
     }
+
+    /// A token stream from tokens: the header record, then one record per (type name, fields).
+    fn stream(records: &[(&str, Vec<Tok>)]) -> Vec<u8> {
+        let mut d = b"ASM BinaryFile4".to_vec();
+        for v in [22600i32, 0, 2, 0] {
+            d.extend(v.to_le_bytes());
+        }
+        let name = |d: &mut Vec<u8>, tag: u8, s: &str| {
+            d.extend([tag, s.len() as u8]);
+            d.extend(s.as_bytes());
+        };
+        d.extend([0x07, 1, b'p', 0x06]);
+        d.extend(10f64.to_le_bytes());
+        d.push(0x11);
+        for (kind, fields) in records {
+            let parts: Vec<&str> = kind.split('-').collect();
+            for (k, part) in parts.iter().enumerate() {
+                name(&mut d, if k + 1 == parts.len() { 0x0D } else { 0x0E }, part);
+            }
+            for t in fields {
+                match t {
+                    Tok::Int(v) => {
+                        d.push(0x04);
+                        d.extend(v.to_le_bytes());
+                    }
+                    Tok::Real(v) => {
+                        d.push(0x06);
+                        d.extend(v.to_le_bytes());
+                    }
+                    Tok::Str(s) => name(&mut d, 0x07, s),
+                    Tok::False => d.push(0x0A),
+                    Tok::True => d.push(0x0B),
+                    Tok::Ptr(v) => {
+                        d.push(0x0C);
+                        d.extend(v.to_le_bytes());
+                    }
+                    Tok::Id(s) => name(&mut d, 0x0D, s),
+                    Tok::Prefix(s) => name(&mut d, 0x0E, s),
+                    Tok::Open => d.push(0x0F),
+                    Tok::Close => d.push(0x10),
+                    Tok::Pos(v) | Tok::Vec(v) => {
+                        d.push(if matches!(t, Tok::Pos(_)) { 0x13 } else { 0x14 });
+                        d.extend(v.iter().flat_map(|x| x.to_le_bytes()));
+                    }
+                    Tok::Enum(v) => {
+                        d.push(0x15);
+                        d.extend(v.to_le_bytes());
+                    }
+                    Tok::Long(v) => {
+                        d.push(0x17);
+                        d.extend(v.to_le_bytes());
+                    }
+                }
+            }
+            d.push(0x11);
+        }
+        d
+    }
+
+    fn id(s: &str) -> Tok {
+        Tok::Id(s.into())
+    }
+
+    #[test]
+    fn definitions_references_colours_and_transforms() {
+        let common = || vec![Tok::Ptr(-1), Tok::Int(-1), Tok::Ptr(-1)];
+        // a straight B-spline from the origin to (2, 0, 0): degree 1, two knots
+        let line = || {
+            let mut t = vec![id("nubs"), Tok::Int(1), Tok::Enum(0), Tok::Int(2), Tok::Real(0.0), Tok::Int(1), Tok::Real(1.0), Tok::Int(1)];
+            t.extend([0.0, 0.0, 0.0, 2.0, 0.0, 0.0].map(Tok::Real));
+            t
+        };
+        let with = |mut fields: Vec<Tok>, more: Vec<Tok>| {
+            fields.extend(more);
+            fields
+        };
+        // 1: a pcurve whose definition holds another one, 2: the curve, 3: a reference to it,
+        // 4: a curve without a B-spline, 5: a face colour, 6: a transform, 7: a 64-bit integer
+        let mut inner = vec![Tok::True, Tok::Open, id("exp_par_cur"), Tok::Open, id("exact_spl_sur"), Tok::Int(22600), Tok::Close, Tok::Close];
+        inner.insert(0, Tok::Int(0));
+        let mut curve = vec![Tok::True, Tok::Open, id("exact_int_cur"), Tok::Int(22600), Tok::Enum(0)];
+        curve.extend(line());
+        curve.extend([Tok::Real(0.0), Tok::Close]);
+        let records = vec![
+            ("pcurve", with(common(), inner)),
+            ("intcurve-curve", with(common(), curve)),
+            ("intcurve-curve", with(common(), vec![Tok::True, Tok::Open, id("ref"), Tok::Int(2), Tok::Close])),
+            ("intcurve-curve", with(common(), vec![Tok::True, Tok::Open, id("helix_int_cur"), Tok::Int(22600), id("nullbs"), Tok::Close])),
+            (
+                "NMx_FFColor_Entity-NamingMatching-attrib",
+                vec![Tok::Ptr(-1), Tok::Int(-1), Tok::Ptr(-1), Tok::Ptr(-1), Tok::Ptr(42), Tok::Int(43), Tok::Str("255,0,51".into()), Tok::Int(0)],
+            ),
+            (
+                "transform",
+                vec![
+                    Tok::Ptr(-1),
+                    Tok::Int(-1),
+                    Tok::Vec([0.0, 1.0, 0.0]),
+                    Tok::Vec([-1.0, 0.0, 0.0]),
+                    Tok::Vec([0.0, 0.0, 1.0]),
+                    Tok::Vec([5.0, 6.0, 7.0]),
+                    Tok::Real(2.0),
+                    Tok::True,
+                ],
+            ),
+            ("some-attrib", vec![Tok::Long(1_508_913_994), Tok::Int(3)]),
+        ];
+        let b = parse(&stream(&records)).unwrap();
+        assert_eq!(b.records.len(), 8);
+        // the definitions in the order of their `{`: the pcurve, the surface inside it, the curve
+        assert_eq!(b.definitions, vec![(1, 5), (1, 7), (2, 4), (4, 4)]);
+        let Some(Curve::Spline(c)) = b.curve(2) else { panic!("{:?}", b.curve(2)) };
+        assert_eq!((c.degree, c.eval(0.5)), (1, [1.0, 0.0, 0.0]));
+        assert_eq!(b.curve(3), b.curve(2));
+        assert_eq!(b.curve(4), Some(Curve::Other("intcurve-curve helix_int_cur".into())));
+        assert_eq!(b.definition(3).map(|d| d.0), Some("exact_int_cur"));
+        assert_eq!(b.face_colours().get(&42), Some(&[1.0, 0.0, 0.2]));
+        assert_eq!(b.transform(6), Some([[0.0, 2.0, 0.0], [-2.0, 0.0, 0.0], [0.0, 0.0, 2.0], [5.0, 6.0, 7.0]]));
+        assert_eq!(b.records[7].fields, vec![Tok::Long(1_508_913_994), Tok::Int(3)]);
+    }
 }

@@ -50,7 +50,7 @@ on synthetic files, ~ partly, ✗ not in the specification yet.
 | Helical surfaces and curves (`helix_spl_circ`, `helix_spl_line`, `helix_int_cur`: threads, springs), which store no B-spline | ✗ skipped and counted |
 | Body transforms | ✓ |
 | Face colours (`NMx_FFColor_Entity` attributes, as imported models have them) | ✓ |
-| Assembly display cache: vertex formats, vertex and index buffers, finest level of detail (§5) | ✓ |
+| Assembly display cache: vertex formats, vertex and index buffers, finest level of detail (§5) | ✓ (the parts of a subassembly can be stored away from their place; not corrected) |
 | Assemblies without a display cache, or with an empty one: the placed parts (`AmRxSegment`) with the file of each (`UFRxDoc`), put together from the part files the caller gives | ✓ checked on real files (2014 to 2023) |
 | Suppressed and invisible occurrences, positional representations, level of detail | ✗ every occurrence is shown |
 | Colours and materials (§7) | ~ face colours; a colour that the name of an appearance tells (`Opaque(67,72,77)`, a colour word); the appearance library of the file is not read |
@@ -211,8 +211,15 @@ never commit them), Inventor 2014 to 2023:
 | github.com/robotics-erlangen/hardware (`pasta/mechanics/`) | none stated | 803 | 294 |
 | github.com/starliliko/3d-printed-smart-car-cad (`inventor/`) | none stated | 49 | 119 |
 
-The counts of what opens and what is left out are in the pull request that brought these
-changes; run the command again to get them for the current code.
+Of the 995 parts every one opens: 963 with all their faces, 16 with faces left out (helical
+surfaces of threads, a few cylinder faces whose single loop runs around the surface in steps),
+16 that hold no body. Of the 458 assemblies 415 are shown whole, 25 with something left out
+(part files that are not in the repository or hold no geometry, the faces above) and 18 are
+empty templates. Of 1 172 699 faces 1 172 433 are shown. Not checked against Inventor itself:
+the pictures were compared by eye with the thumbnails in the files, for a handful of them. In
+one assembly the display cache held the parts of a subassembly away from their place; put
+together from its part files the same assembly is right, which is why the part files go first.
+Some faces of a few parts are turned inside out (their triangles face inwards).
 
 ## Test data
 

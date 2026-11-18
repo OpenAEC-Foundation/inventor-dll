@@ -112,6 +112,52 @@ pub fn classes(meta: &[u8]) -> Option<Vec<[u8; 16]>> {
     Some(entries.chunks_exact(28).map(|e| e[4..20].try_into().unwrap_or([0; 16])).collect())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn class_table_of_an_m_stream() {
+        // the unpacked table: two records (sizes 5 and 9), one ten-byte entry, two classes
+        let mut table = vec![0u8; 14];
+        table.extend(2u32.to_le_bytes());
+        table.extend([5u32, 9].iter().flat_map(|v| v.to_le_bytes()));
+        table.extend([0u32, 1].iter().flat_map(|v| v.to_le_bytes()));
+        table.extend([7u8; 10]);
+        table.extend([14u32, 0, 4].iter().flat_map(|v| v.to_le_bytes()));
+        for class in [0xA1u8, 0xB2] {
+            table.extend([0u8; 4]);
+            table.extend([class; 16]);
+            table.extend([0u8; 8]);
+        }
+        assert_eq!(classes(&table), Some(vec![[0xA1; 16], [0xB2; 16]]));
+        assert_eq!(classes(&table[..16]), None);
+
+        // the stream: name, class name, id, twelve bytes, two dates, the codec, zlib
+        let mut m = Vec::new();
+        let tag = b"RSe Meta Stream Version 8";
+        m.extend((tag.len() as u32).to_le_bytes());
+        m.extend(tag);
+        m.extend([0u8; 18]);
+        let name: Vec<u16> = "PmGraphicsSegment".encode_utf16().collect();
+        m.extend((name.len() as u32).to_le_bytes());
+        m.extend(name.iter().flat_map(|u| u.to_le_bytes()));
+        m.extend([9u8; 28]);
+        for date in ["04/04/2021 14:14:10", "04/10/2022 01:43:53"] {
+            m.extend((date.len() as u32).to_le_bytes());
+            m.extend(date.as_bytes());
+        }
+        m.push(1);
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        z.write_all(&table).unwrap();
+        m.extend(z.finish().unwrap());
+        assert_eq!(meta_class(&m).as_deref(), Some("PmGraphicsSegment"));
+        assert_eq!(meta_unpack(&m), Some(table));
+        assert_eq!(meta_unpack(&m[..60]), None);
+    }
+}
+
 /// The codec and the compressed payload of a `B` stream (SPEC §3.4).
 pub fn data_header(b: &[u8]) -> Option<(Codec, &[u8])> {
     if b.len() < 18 || b[..16] != B_MAGIC || b[16] != 4 {
