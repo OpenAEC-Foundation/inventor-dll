@@ -1,3 +1,3 @@
 # inventor-dll
 
-Native library that reads Autodesk Inventor files (`.ipt`, `.iam`). Private, pre-alpha.
+Native library that reads Autodesk Inventor files (`.ipt`, `.iam`). Pre-alpha.
